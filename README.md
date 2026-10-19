@@ -1,5 +1,10 @@
 # Building virtual iPhone using VPHONE600AP component of recently released PCC firmware
 
+> **中文读者 / Chinese readers:** a self-contained Chinese reproduction guide with full background,
+> a glossary, the boot-chain explanation, step-by-step instructions and troubleshooting is available at
+> **[README.zh-CN.md](README.zh-CN.md)**. It is written for iOS engineers who have never touched
+> iBoot/firmware research before.
+
 # Special Thanks / Acknowledgements
 
 - [dlevi309](https://github.com/dlevi309) (Provided ideas for touch interaction on virtual iPhone)
