@@ -53,6 +53,23 @@
 - [14. 兼容性 / Compatibility](#14-兼容性--compatibility)
 - [15. 在 Sequoia 上启用触摸交互 / Enabling Touch Interaction on Sequoia](#15-在-sequoia-上启用触摸交互--enabling-touch-interaction-on-sequoia)
 - [16. 项目源码 / Project SRC](#16-项目源码--project-src)
+- [17. vphone-cli 实现剖析 / Implementation Deep Dive](#17-vphone-cli-实现剖析--implementation-deep-dive)
+  - [17.1 一句话结论与规模](#171-一句话结论与规模--scale)
+  - [17.2 进程与产物结构](#172-进程与产物结构--processes-and-bundle-layout)
+  - [17.3 固件准备：`fw prepare`](#173-固件准备fw-prepare--firmware-preparation)
+  - [17.4 固件打补丁：`fw patch`](#174-固件打补丁fw-patch--patching-the-boot-chain)
+  - [17.5 恢复固件：`restore`](#175-恢复固件restore--in-process-restore)
+  - [17.6 CFW 安装：`cfw install`](#176-cfw-安装cfw-install--guest-system-installation)
+  - [17.7 虚拟机运行](#177-虚拟机运行--running-the-vm)
+  - [17.8 guest 控制面：`vphoned`](#178-guest-控制面vphoned--guest-control-plane)
+  - [17.9 guest 侧组件与注入链](#179-guest-侧组件与注入链--guest-components)
+  - [17.10 模板、快照与磁盘](#1710-模板快照与磁盘--templates-snapshots-disk)
+  - [17.11 安全模型与权限边界](#1711-安全模型与权限边界--security-model)
+  - [17.12 网络四模式](#1712-网络四模式--networking)
+  - [17.13 Launchpad：图形化的那一层](#1713-launchpad图形化的那一层--the-app)
+  - [17.14 与本文手工流程的逐条对照](#1714-与本文手工流程的逐条对照--writeup-vs-implementation)
+  - [17.15 复现命令速查](#1715-复现命令速查--command-cheat-sheet)
+  - [17.16 本节结论](#1716-本节结论--takeaways)
 - [附录 A：固件补丁速查表](#附录-a固件补丁速查表)
 - [附录 B：故障排查清单](#附录-b故障排查清单)
 - [附录 C：法律、伦理与风险提示](#附录-c法律伦理与风险提示)
@@ -673,6 +690,51 @@ let displays_config = VZMacGraphicsDisplayConfiguration(
 > 3. 分辨率正文 `1179×2556`（iPhone 14 Pro）vs 官方 `1290×2796`。
 > 这些差异**不影响启动**，但会影响 SHSH 是否可复现、以及显示比例。
 
+**vphone-cli 对应实现**（详见 [17.7](#177-虚拟机运行--running-the-vm)）
+
+原文这段改造 `super-tart` 的 `vzHardwareModel_VRESEARCH101()`，在 vphone-cli 里是一段几乎逐行对应的代码：
+
+```swift
+// VPhoneVirtualization/UI/VirtualMachine/VPhoneVirtualMachineHardwareModel.swift
+static func createModel() throws -> VZMacHardwareModel {
+    let desc = Dynamic._VZMacHardwareModelDescriptor()
+    desc.setPlatformVersion(NSNumber(value: UInt32(3)))   // PV=3
+    desc.setBoardID(NSNumber(value: UInt32(0x90)))        // vresearch101
+    desc.setISA(NSNumber(value: Int64(2)))
+    let model = Dynamic.VZMacHardwareModel
+        ._hardwareModelWithDescriptor(desc.asObject).asObject as! VZMacHardwareModel
+    guard model.isSupported else { throw VPhoneVirtualMachineError.hardwareModelNotSupported }
+    return model
+}
+```
+
+原文里那三处「不一致」，工程实现给了明确答案：
+
+| 原文的分歧 | vphone-cli 的选择 | 位置 |
+| --- | --- | --- |
+| `setISA(2)` vs `.appleInternal4` | **`2`**（数值一样，写法不同） | `VPhoneVirtualMachineHardwareModel.swift` |
+| ECID `0x1111…` vs `0x1de1…` | **不写死**，由 `machineIdentifier` 推导，首次启动后写入 `udid-prediction.txt` | `VPhoneVirtualMachine.swift` |
+| 分辨率 `1179×2556` vs `1290×2796` | **`1290×2796 @ 460 ppi`**（`ScreenConfig.default`） | `VPhoneVirtualMachineManifest.swift` |
+
+分辨率这一项比原文更进一步：它不是常量，而是 `config.plist` 里的 `screenConfig`。
+iPad guest 会换成对应面板（比如 iPad mini 的 1488×2266 @ 326 ppi），
+所以同一个二进制既跑 iPhone 也跑 iPad。
+
+触摸也一样。原文第 15 节手写的鼠标事件重写，在 vphone-cli 里长成
+`VPhoneVirtualMachineView`（`VZVirtualMachineView` 的子类），而且代码注释直接引用了
+本文的 `ScreenSharingVNC.swift`：
+
+```swift
+// VPhoneVirtualMachineView.swift:125
+/// https://github.com/wh1te4ever/super-tart-vphone-writeup/blob/main/contents/ScreenSharingVNC.swift
+private var multiTouchDevice: AnyObject? { … Dynamic(vm)._multiTouchDevices … }
+```
+
+设备清单也是同一套私有 API：`_VZUSBTouchScreenConfiguration`（触摸）、
+`_VZPL011SerialPortConfiguration`（串口，对应原文的 `serial=3` 日志）、
+`_VZSEPCoprocessorConfiguration`（SEP + `SEPStorage`）、
+`_VZGDBDebugStubConfiguration`（对应原文说的「支持实时内核调试」）。
+
 ---
 
 ## 4. 改造固件 / Modifying the Firmware
@@ -742,6 +804,24 @@ let displays_config = VZMacGraphicsDisplayConfiguration(
 - **为什么必须关 SIP/AMFI**：super-tart 要加载自定义 bootrom、走私有 API，AMFI 会拦住未签名
   二进制/kext；SIP 会拦住对系统关键路径的替换。这正是 [0.3](#03-宿主机环境与工具链含-step-1) 里那几条命令的原因。
 - **bootchain 与各名词的对应关系**见 [0.2（2）](#02-术语表与-apple-启动链)。
+
+**vphone-cli 对应实现**（详见 [17.3](#173-固件准备fw-prepare--firmware-preparation)）
+
+原文这一节是「读懂 vma2pwn 的思路」加上「照抄 vma2pwn 的做法」，没有可运行代码。
+vphone-cli 把它拆成了两个明确的动作：
+
+| 原文的说法 | vphone-cli 的对应 |
+| --- | --- |
+| 「解包成 RAW，在写死的地址打补丁」 | 保留（这是 `fw patch` 的核心），但**地址不再写死**，见[第 8 节](#8-给固件组件打补丁--patching-firmware-components)的补充 |
+| 「补掉完整性校验」 | `avpbooter-boot-dgst_bypass`、`*-boot-image4_callback`、`txm-boot-trustcache_bypass` 等声明式补丁 |
+| 「改 boot-args 方便看日志」 | `ibec-boot-boot_args` / `llb-boot-boot_args`，字符串**和原文一字不差** |
+| 「进入 DFU 模式再恢复」 | `vm launch --dfu` + `restore`（进程内完成，见[第 9 节](#9-恢复固件--restoring-firmware)） |
+| 「SIP/AMFI 必须关」 | 有替代路径：SIP 可保持开启，只需 allowlist，见 [17.11](#1711-安全模型与权限边界--security-model) |
+
+原文提到的「支持实时内核调试」，vphone-cli 默认就开着：
+`VPhoneVirtualMachine` 在组装配置时挂上 `_VZGDBDebugStubConfiguration`，
+不指定端口就由系统分配，指定了就走 `--kernel-debug-port`（6000–65535）。
+这是 vma2pwn 那套「改造 tart 加 GDB 调试」在工程实现里的等价物。
 
 ---
 
@@ -848,6 +928,33 @@ python3 patch_fw.py
 
 **检查点**：`patch_fw.py` 跑完不报错；`iPhone17,3_26.1_23B85_Restore/` 下留有一堆 `.bak` 备份。
 
+**vphone-cli 对应实现**（详见 [17.3](#173-固件准备fw-prepare--firmware-preparation)）
+
+原文作者坦言「记不清具体混了哪些」，只留下 `custom_26.1/BuildManifest.plist` 和
+`Restore.plist` 两个黑盒结果。vphone-cli 把这件「记不清」的事写成了可读规则，
+落在 `VPhoneFirmwarePreparer.prepare()` 里：
+
+| 组件 | 来自 | 原文的做法 |
+| --- | --- | --- |
+| LLB / iBSS / iBEC / iBoot | PCC `vresearch101ap` | `cp Firmware/dfu/*`、`Firmware/all_flash/*` |
+| sptm / txm | PCC（`Firmware/*.im4p`） | 同一句 `cp Firmware/*.im4p` |
+| DeviceTree / SEP / KernelCache / RecoveryMode | PCC `vphone600ap` | 混在 `all_flash/*` 里一起拷 |
+| `SystemVolume` / `OS` / `StaticTrustCache` / `RestoreRamDisk` | iPhone 17,3 | 保留原恢复目录，不覆盖 |
+
+两个 plist 的处理方式也变了。原文是整份覆盖，vphone-cli 是在 Swift 里**重新生成**
+混合 BuildManifest，并且**会先校验**：
+
+- 虚拟机的 DFU 身份必须是 `vresearch101ap`（BDID `0x90`），否则 TSS 拿不到票据；
+- 运行时组件必须来自 `vphone600ap`，因为只有它的设备树把 MKB 的 `dt` 置 1，
+  允许无系统 keybag 启动；
+- 目标 cloudOS 里如果没有 `vphone600ap`，**在解包前就拒绝**，
+  而不是等 restore 阶段才炸。原文读者拿 26.4 之后的 cloudOS 去试，
+  会在恢复中途失败；vphone-cli 直接说「这个 cloudOS 里没有 `vphone600ap`」。
+
+合并过程也有区别。原文是 `os.system("cp …")` 直接往恢复目录里覆盖，
+中途失败就留下半个树；vphone-cli 在**一次性临时目录**里完成全部解包与合并，
+整体成功后才移进 VM 目录。
+
 ---
 
 ## 6. 打补丁 AVPBooter.vresearch1.bin / Patch AVPBooter.vresearch1.bin
@@ -892,6 +999,47 @@ python3 patch_fw.py
 
 > **原理提示**：见 [第 8 节](#8-给固件组件打补丁--patching-firmware-components)开头「为什么是这把钥匙」。
 
+**vphone-cli 对应实现**（详见 [17.7](#177-虚拟机运行--running-the-vm)「（4）OpenAVB / OpenSEP」）
+
+原文这一节的整套手工流程，在 vphone-cli 里有两条路，而且**默认走的是不做这件事的那条**。
+
+**（1）Apple ROM 上：同一种定位法，但不是同一段代码**
+
+`AVPBooterPatcher` 的策略和原文的 IDA 流程几乎一致，
+但它把「人眼在 IDA 里找 epilogue」换成了固定的五步：
+
+1. 反汇编整个二进制；
+2. 找第一条引用 DGST 标记（`0x4447`，即 `0x44475354` 的低半）的指令；
+3. 向后最多 512 条，找最近的 `ret` / `retaa` / `retab`；
+4. 从 `ret` 向前最多 32 条，找最后一条写 `x0` / `w0` 的 `mov`，或条件选择（`cset`/`csinc`/`csinv`/`csneg`）；
+5. 把那条指令改成 `mov x0, #0`。
+
+原文提醒「更稳妥的传法是只改返回值、不破坏函数体」，vphone-cli 的算法正是这个传法：
+它**不动函数体**，只改返回前那一条写 `x0` 的指令。补丁名是 `avpbooter-boot-dgst_bypass`。
+
+**（2）新机器上：换掉 ROM，这一节整节的工作直接消失**
+
+vphone-cli 新建的虚拟机默认启动 [OpenAVB](https://github.com/owngoal-dev/OpenAVB)，
+它**不校验任何镜像摘要**。于是 `fw patch` 会读 manifest 判断 ROM 类型，
+然后**跳过整个 AVPBooter 组件**：
+
+```
+[*] Boot ROM:          OpenAVB, which needs no ROM patch
+```
+
+补丁标识仍然保持被选中、被规划，这样 `fw patches` 不会误报漂移。
+两种 ROM 可以随时互换，不需要重新恢复，因为**它们加载的是同一个已打补丁的 LLB**：
+
+```sh
+vphone-cli vm config myphone --rom openavb --seprom opensep   # 开源 ROM
+vphone-cli vm config myphone --rom apple --seprom apple       # Apple 的 ROM + 本节的补丁
+```
+
+> 代价是**多了一段 DFU 协议**：OpenAVB 不携带任何 iBoot 版本信息，
+> 宿主必须先把 iBSS 的身份（IM4P 大小、SHA-256、解压后大小、加载地址、异常级）
+> 通过 vendor 请求写进它的 patch-store stage 0，它才肯接收。
+> 这段代码在 `MobileRestoreCore/Recovery/openavb.c`，原文没有对应物。
+
 ---
 
 ## 7. 改造并编译 libirecovery / Modifying and Building libirecovery
@@ -933,6 +1081,31 @@ cd libirecovery
 - 安装后可用 `irecovery -q` 验证是否能看到设备信息。
 
 **检查点**：`irecovery -q` 能打印出 `vresearch101ap` 相关字段。
+
+**vphone-cli 对应实现**（详见 [17.5](#175-恢复固件restore--in-process-restore)）
+
+原文为了支持 `vresearch101ap` 而去改造并编译 libirecovery，vphone-cli 的做法是
+**把它编进自己的进程**：
+
+| 原文 | vphone-cli |
+| --- | --- |
+| `git clone wh1te4ever/libirecovery && make install` | `VPhoneRestore/MobileRecoveryCore`（vendored libirecovery，Xcode 直接编译） |
+| Homebrew 或源码编译的 `idevicerestore` | `VPhoneRestore/MobileRestoreCore`（vendored idevicerestore） |
+| `irecovery -q` 验证 | `vphone-cli restore recovery-probe --ecid <hex>` |
+
+「为什么要改造 libirecovery」这个原因仍然成立：
+官方实现不认识 `vresearch101ap`，无法在 DFU 下正确识别并上传镜像。
+vphone-cli 只是在 vendored 的那份里做了同样的支持，而不需要一个全局安装的库。
+
+这一步带来的实际差别是「不需要装任何东西」：
+`vphone-cli restore` 在当前进程内完成恢复，没有外部 `idevicerestore`、`irecovery` 可依赖，
+也没有版本漂移的可能。原文里 `irecovery -f …` 那一串上传命令，
+对应的是 `restore` 内部的组件发送序列。
+
+> 顺带一个原文没有的选项：`vphone-cli restore --offline`（`-O`）是离线恢复，
+> 就地解密 AEA 镜像并使用缓存的 `.shsh`。原文要绕开在线取票，靠的是
+> `fake_tss_server.py`；工程实现里把这个需求做成了一个受支持的 flag，
+> 而不是一个需要自己搭的假 TSS 服务器。
 
 ---
 
@@ -1145,6 +1318,65 @@ kernelcache 和 TXM 的 IM4P 末尾有 **PAYP** 结构。直接用 `pyimg4 im4p 
 
 **（3）补丁速查表**：见 [附录 A](#附录-a固件补丁速查表)。
 
+**vphone-cli 对应实现**（详见 [17.4](#174-固件打补丁fw-patch--patching-the-boot-chain)）
+
+原文这一节的 12 行 `patch(0x…. , 0x….)` 是最能体现「两代实现差异」的地方。
+vphone-cli 干的**是同一件事**，但没有任何一个偏移是写死的，而且每个补丁都有了名字：
+
+| 原文的调用 | vphone-cli 的补丁标识 | 找位置的方法 |
+| --- | --- | --- |
+| iBSS/LLB `patch(0x9D10, nop)` + `0x9D14, mov x0,#0` | `ibss-boot-image4_callback` / `llb-boot-image4_callback` | 找 `b.ne` 紧跟 `mov x0, x22`，前 8 条内有 `cmp` |
+| iBSS `patch(0x1b544, b)` | `ibss-boot-skip_generate_nonce` | 分支模式匹配 |
+| iBEC/LLB 写 boot-args 指针 + 字符串 | `ibec-boot-boot_args` / `llb-boot-boot_args` | 字符串锚点 + 写指针的指令序列 |
+| LLB 五处 `0x2BFE8` 等（放行被编辑的 rootfs） | `llb-boot-rootfs`（多条记录） | 分支模式 + 上下文 |
+| TXM 三处 `mov x0,#0` | `txm-boot-trustcache_bypass` | 二分查找调用点 → `mov x0,#0` |
+| kernel `0x2476964`（`_apfs_vfsop_mount`） | `kernel-boot-apfs_vfsop_mount` | panic 字符串 + 调用图 |
+| kernel `0x23cfde4`（`_authapfs_seal_is_broken`） | `kernel-boot-apfs_seal_broken` | 同上 |
+| kernel `0xf6d960`（`_bsd_init`） | `kernel-boot-bsd_init_rootvp` | 见下 |
+
+以 iBSS 那条补丁为例，工程实现长这样：
+
+```swift
+// FirmwarePatcher/IBoot/BasePatches/IBootPatchImage4Callback.swift
+guard a.mnemonic == "b.ne" else { continue }
+guard b.mnemonic == "mov", b.operandString == "x0, x22" else { continue }
+let hasCmp = insns[lookback ..< i].contains { $0.mnemonic == "cmp" }
+// 打分：前 64 条内出现 movn w22 / mov w22,#-1 的优先（错误返回路径）
+emit(off,     ARM64.nop,     id: "\(component)-boot-image4_callback.bne")
+emit(off + 4, ARM64.movX0_0, id: "\(component)-boot-image4_callback.mov")
+```
+
+**为什么这一改很重要**：原文 8.2 节的 `patch(0x9D10, …)` 只要固件版本一变就全废，
+所以原文只能锁定 26.1 / 23B85。vphone-cli 的定位是语义的，
+因此能覆盖 iOS 26.0 到 27.0.1 这么宽的范围。
+
+`_bsd_init` 那条尤其值得对照。原文是「打一个 `nop`」；工程实现的第一步是把补丁点
+**重新找出来**：定位 `bsd_init` → 找 rootvp panic 块 → 在该函数内找唯一的 `call` 指令
+→ 其后紧跟 `cbnz` → 再跟 `bl imageboot_needed`，最后只改那条分支门控。
+这段定位流程还作为规范写进了仓库的 `AGENTS.md`，防止后来人退回硬编码。
+
+**PAYP 那件事依然成立**。`IM4PHandler` 会为 `trxm` 和 `krnl` 这两个类型
+保留 PAYP：从原始数据里找到 `PAYP` magic，**从它前 10 字节开始**截取整段尾部，
+追加到重建的 IM4P 后面，并把长度加进顶层 DER 长度字段。
+原文 8.2 节说的那个坑，在工程实现里是一段带名字的函数（`appendPAYPIfPresent`）。
+
+**补丁变成数据之后多出来的能力**：
+
+```sh
+vphone-cli fw patches myphone                        # 看全部声明、预设、以及哪些还没落到 guest
+vphone-cli fw set-patches myphone --block kernel-cfw-debugger
+vphone-cli fw patch myphone                          # 重新解析并落盘
+```
+
+原文里「想关掉某个补丁」只能去改 Python 源码；现在它是一次勾选，
+而且因为 `FirmwareOriginals/` 保存了未修改的原始字节，
+**关闭补丁是真的回到原始字节**，不是反向应用一遍。
+
+> 还有一条原文没有、但很实用的约束：版本门。比如
+> `kernel-boot-thread_guard_violation` 被钉死在 iOS 18，
+> `dyld-boot-maxslide` 钉死在 iOS 27。预设可以关掉一个补丁，
+> 但不能把一个补丁**强行放宽**到它没有验证过的版本上。
+
 ---
 
 ## 9. 恢复固件 / Restoring Firmware
@@ -1221,6 +1453,41 @@ idevicerestore -e -y ./iPhone17,3_26.1_23B85_Restore
 
 > 注：仓库里还有 `CFW/fake_tss_server.py` + `tss_response`，用于在无法联网/无法拿正规
 > ticket 时伪造 TSS 响应，属于进阶用法。
+
+**vphone-cli 对应实现**（详见 [17.5](#175-恢复固件restore--in-process-restore)）
+
+原文那三条 `idevicerestore` 命令，在 vphone-cli 里是：
+
+```sh
+vphone-cli vm launch myphone --dfu &
+vphone-cli restore myphone                 # 在线取票 + 恢复，全在进程内
+vphone-cli restore myphone --get-shsh      # 只要票据（对应原文的 -t）
+```
+
+| 原文 | vphone-cli |
+| --- | --- |
+| `-t`（只抓 ticket） | `--get-shsh` / `-t` |
+| `-e`（erase 全新恢复） | 默认行为，**没有**「不擦除」模式（见下） |
+| `-y`（全部确认） | 不需要，非交互 |
+| `gunzip` 处理 SHSH | 内部处理 |
+| `fake_tss_server.py` | `--offline` + 缓存的 `.shsh` |
+
+**原文这一节那个 panic，工程实现给出了根因判断**：Cryptex 分区没能被恢复，
+导致 `libSystem.B.dylib` 缺失。vphone-cli 不能靠 SSH Ramdisk 去救，
+它改成**在宿主机离线把 Cryptex 补进去**（下一步 `cfw install`），
+所以恢复完成后**不会再出现这个 panic**。
+
+还有一个原文没有的坑被显式化：`--no-erase` 这个 flag **存在但被拒绝使用**。
+代码注释里写了实测结论：在 iPhone 27.0 (24A435) + cloudOS 26.4 上尝试就地恢复，
+失败三次（混合 manifest 没有 Upgrade 身份；补上之后 cloudOS 的恢复 ramdisk
+仍会重建分区图和系统 keybag、擦掉 Data 卷；iPhone 的 update ramdisk 在 cloudOS
+恢复内核上 panic）。保留这个 flag 是为了「让用它的脚本拿到这个原因，
+而不是一个用法错误」。
+
+> 想重现原文那种「SEP 配置错误导致 panic」的场景，可以直接对比：
+> vphone-cli 的 `SEPStorage`、`nvram.bin`、`Disk.img` 三件套是**同一次恢复**产出的，
+> 互相之间必须匹配。把它们在虚拟机之间互换，同样会 panic。
+> 参见 [17.10](#1710-模板快照与磁盘--templates-snapshots-disk) 里快照为什么必须三件一起搬。
 
 ---
 
@@ -1728,6 +1995,47 @@ python3 fix_boot.py
 - **mobileactivationd**：绕过激活锁（hactivation = 激活状态标记；让 `should_hactivate` 永远返回真）。
 - **launchd** 本体：防止 jetsam 属性未初始化导致的 `initproc exited` panic。
 
+**vphone-cli 对应实现**（详见 [17.6](#176-cfw-安装cfw-install--guest-system-installation)）
+
+原文这一节有 500 多行，是整个 writeup 里最重的一段：做 SSH Ramdisk、
+拿 root shell、`snaputil -n`、然后跑 `fix_boot.py` 的九个步骤。
+vphone-cli 用**一条命令**替代了整节：
+
+```sh
+vphone-cli cfw install myphone      # 需要 root
+```
+
+**换掉了什么**：原来必须「启动一个 ramdisk、SSH 进去、在客户机里改盘」，
+现在改成「**在宿主机上离线挂载虚拟机的磁盘镜像**」。VM 必须关机，
+`Disk.img` 被 APFS clone 到私有工作目录，改完整体 rename 覆盖，失败时原盘不动。
+整个过程不需要 ramdisk、不需要 SSH、不需要网络。
+
+九个步骤的对应关系：
+
+| 原文 `fix_boot.py` 的步骤 | vphone-cli 的实现 | 差异 |
+| --- | --- | --- |
+| 1. 解密并安装 Cryptex（`SystemOS`/`AppOS`） | `FirmwarePatcher/CryptexFilesystem/` 七个文件 | 多了**重新封卷**（`…Sealing.swift`）与 manifest 哈希更新 |
+| 2. `snaputil -n` 重命名根快照 | `vphone-cli cfw flip-snapshot` | 完全离线，不挂载、不调 `fs_snapshot` |
+| 3. patch `seputil`（固定 `AA.gl`） | `system-seputil-boot-gigalocker_uuid` | 同样是改 cstring 里的 uuid 字段为 `AA` |
+| 4. 安装 GPU bundle | 从 cloudOS 自动提取（[17.3](#173-固件准备fw-prepare--firmware-preparation)） | 不再需要自己准备 tar |
+| 5. 安装 `iosbinpack64` | **不做** | 工程实现不装任何 bootstrap，用 `vphoned` 取代 |
+| 6. patch `launchd_cache_loader` | `system-launchd_cache_loader-boot-unsecure_cache_gate` | 同样是把那个 `cbz` 打掉 |
+| 7. patch `mobileactivationd` | `system-mobileactivationd-boot-should_hactivate` | 同样是 `mov x0,#1` 覆盖 getter |
+| 8. patch `launchd`（防 jetsam panic） | `system-launchd-boot-jetsam_panic_guard_bypass` | 同名语义 |
+| 9. 注入 bash/dropbear/trollvnc 自启 | **不做** | 控制面换成 VSOCK + `vphoned`，见[第 13 节](#13-第二次启动尝试--second-boot-attempt) |
+
+**seputil 那一步的解释，工程实现比原文更细**。原文说「gigalocker 文件名和固件里写死的
+期望不一致」，代码注释把机理写清楚了：`seputil` 用
+`snprintf(path, n, "%s/%s.gl", mountpoint, uuid)` 拼路径，缓存的是**设备自己的 UUID**；
+vphone guest 没有那个 UUID，所以找不到文件。把 format string 的第二个 `%s`
+改成常量 `AA`，就能解析到安装时放好的 `AA.gl`。
+注意它**故意保留第一个 `%s`**：mountpoint 在运行时会在 `/mnt7` 和 `/private/xarts`
+之间二选一，两者都得能工作。
+
+**为什么不需要 ramdisk 也能改根卷**：原文必须靠 SSV 的补丁让「被编辑的 rootfs」能启动；
+vphone-cli 因为是在宿主机直接改盘，改完自己**重新封卷**并把哈希写回 BuildManifest，
+所以 guest 侧看到的仍是一个「自洽」的系统卷。
+
 ---
 
 ## 11. 第一次启动尝试 / First Boot Attempt
@@ -1751,6 +2059,38 @@ python3 fix_boot.py
 - 「respring」= iOS 的 SpringBoard（桌面/窗口管理器）重启，不是整机重启，表现为闪一下回到主屏。
 - 这里卡住的原因，是**缺用户态的 GPU/Metal 驱动**（内核已经认得 `AppleParavirtGPU`，
   但用户态缺 `AGXMetal*` 一类库）。→ 见[第 12 节](#12-实现-metal--implementing-metal)。
+
+**vphone-cli 对应实现**
+
+这一段「越过黑底设置页就 respring」的根因判断是对的，工程实现沿着同一条线索继续往下走，
+并且把「为什么明明内核认得 GPU、用户态还是没有 Metal」拆成了两层：
+
+| 现象 | 原因 | vphone-cli 的处理 |
+| --- | --- | --- |
+| 内核 `ioreg` 里有 `AppleParavirtGPU`，`MTLCreateSystemDefaultDevice()` 却返回 null | 用户态缺 `AppleParavirtGPUMetalIOGPUFamily.bundle` | 从 cloudOS 恢复卷自动提取并装进 `System/Library/Extensions` |
+| 装了 bundle 仍黑屏、`backboardd` 报 Metal 编译中断 | bundle 里**没有** `libAppleParavirtCompilerPluginIOGPUFamily.dylib` | 用源码重新实现该插件并编进 bundle |
+| 只有 App 拿到 Metal，命令行工具拿到 null | 26.x sandbox 不认识研究板的 paravirtual 设备 | `kernel-cfw-paravirt_user_clients`（27 上是引导必需的 `kernel-boot-iouc_sandbox_gate`） |
+
+第三条是原文完全没有的一层。原文的排查停在「装 bundle」，而工程实现发现
+即使 bundle 装好，`AppleParavirtDeviceUserClient` 也会被 sandbox 拒绝：
+
+```
+System Policy: MetalTest(648) deny(1) iokit-open-user-client AppleParavirtDeviceUserClient
+IOServiceOpen returned kIOReturn(0xE00002E2)
+```
+
+同一个门禁还会拒绝 `com.apple.WebKit` 的硬解、`spotlightknowledged` 的 ANE、
+以及 `vphoned` 的缩放器。所以这条补丁只放行**四个按名字列出的 paravirt 设备类**，
+其他拒绝一概保留。
+
+一个连带影响：`cameracaptured` 每次启动都会在 GPU 上预热拍摄着色器，
+被拒绝后会崩在 paravirtual Metal 驱动里并 crash-loop；
+第一个碰 AVCapture 的进程会阻塞在这个同步 XPC 上，而主线程的 SpringBoard
+正好是其中之一。这也是第 12 节那条相机补丁必须和这条共存的原因。
+
+至于原文说的「respring」，vphone-cli 有对应的免重启手段：
+`system.respring`（RPC）与 `vphoned` 的 `system.uicache`，
+不用整机重启就能重载 SpringBoard 和图标缓存。
 
 ---
 
@@ -1887,6 +2227,50 @@ cd ~/Developer/super-tart-vphone
 整体搬进虚拟机，Metal 就通了；其中还缺一个 dylib，作者**反向重写**了一个
 `libAppleParavirtCompilerPluginIOGPUFamily.dylib`（这也是仓库里唯一缺源码的部分）。
 
+**vphone-cli 对应实现**（详见 [17.3](#173-固件准备fw-prepare--firmware-preparation)「（3）GPU 驱动从哪来」）
+
+原文这一节的两次排查（先用 `MetalTest` 确认不支持，再发现内核其实认了 GPU，
+最后找到 `AGXMetalA10` 的对应物），在工程实现里变成了一个**自动化的固定流程**：
+
+1. 建一台**无网络设备**的临时虚拟机；
+2. 启动到 DFU；
+3. 用进程内恢复后端恢复所选 cloudOS IPSW；
+4. 只读挂载恢复出来的 System 卷，取出 `AppleParavirtGPUMetalIOGPUFamily.bundle`；
+5. 删掉临时虚拟机；
+6. 按 cloudOS build 缓存到 `~/.vphone/gpu-drivers/<version>_<build>/`。
+
+所以原文里「需要你自己准备 `custom_26.1/AppleParavirtGPUMetalIOGPUFamily.tar`」
+这件事不再存在，bundle 一定和内核同源。装进 guest 的位置也和原文一致：
+`System/Library/Extensions/AppleParavirtGPUMetalIOGPUFamily.bundle`。
+
+**关于作者没公开的那个 dylib**：原文最后卡在
+`libAppleParavirtCompilerPluginIOGPUFamily.dylib` 缺源码，只能黑屏。
+vphone-cli 的解法是**用源码重写了一份**
+（`VPhoneGuestComponents/GraphicLoader/main.mm`，源自 0xjohnnydev 的 metal-patch），
+在 Xcode 构建期编进 bundle 的 `guest-resources`，`fw prepare` 时再拷进暂存的 GPU bundle。
+
+这就补上了原文最后缺的那一环：cloudOS 26.4 的 bundle 里有
+`DTPlatformVersion=26.4`、`CFBundleVersion=64.4.4`，**确实没有**这个插件。
+没有它，`MTLCompilerService` 反复 abort、`backboardd` 报 Metal 编译中断，
+表现就是「宿主窗口全黑，但 vphoned 连得上」，和原文第 11 节的症状同源。
+
+GPU 真正跑起来的量化结果（M5 Pro，iPadOS 26.6.2 guest + cloudOS 26.4 内核）：
+
+| 项目 | guest | host |
+| --- | --- | --- |
+| 2048×2048 compute pass | 2.3–3.8 ms | 2.0–3.3 ms |
+| 空命令缓冲 + `waitUntilCompleted` | 0.12–0.27 ms | 0.02 ms |
+| 着色器编译（热） | 80–220 ms | 265 ms（未缓存） |
+| 同一次启动的首次编译 | **4.3–8.3 s** | — |
+
+也就是说 GPU 工作量本身接近原生速度，代价在**同步往返**（贵 6–13 倍）和
+**首次编译**。这解释了原文读者常问的「为什么刚开机时卡一阵」。
+
+> 想自己确认驱动在位：`device.ioreg` 能列出研究板的 paravirtual GPU 设备，
+> 而 `MetalTest` 这类**非 App 沙盒**的程序即使在驱动正常时也可能拿到 null，
+> 这和原文第 11、12 节看到的现象不是一回事。要验证用户态 Metal，
+> 应该在 guest 的 App 里试，或者直接观察窗口能不能渲染出设置界面。
+
 ---
 
 ## 13. 第二次启动尝试 / Second Boot Attempt
@@ -1931,6 +2315,45 @@ ssh root@127.0.0.1 -p2222 halt
 ```
 
 > 越狱属于完全可选的「附加题」，与「跑起虚拟 iPhone」无关，建议先确保前 12 步稳定再做。
+
+**vphone-cli 对应实现**（详见 [17.8](#178-guest-控制面vphoned--guest-control-plane)）
+
+原文为了解决三件具体的事，装了三个开机自启进程：`bash`、`dropbear`、`trollvnc`。
+vphone-cli 把它们换成了**一个 root 守护进程 + VSOCK**，三件事各有对应物：
+
+| 原文的进程 | 解决什么 | vphone-cli 的对应 |
+| --- | --- | --- |
+| `bash`（开机自启） | 要有个能敲命令的 shell | `vphoned` 的 `processes.list` / `apps.launch`，或装 Irisin bootstrap 后自带 |
+| `dropbear`（22222 端口） | 要能远程执行、传文件 | `vphoned` 的 `files.*` 与 157 个 RPC 方法 |
+| `trollvnc`（5901 端口，密码 `alpine`） | 要看屏幕、点按 | `vphone.sock` 的 `screenshot` / `tap` / `swipe`，或宿主 VM 窗口本身 |
+
+**Home 键**这件事原文是「没实现，用 iproxy/VNC 绕」。vphone-cli 直接做了：
+
+```sh
+# 窗口菜单 Keys → Home，或者走 RPC
+{"t":"rpc","method":"input.button","params":{"name":"home"}}
+```
+
+原文说「键盘 CMD + H 模拟 Home」，工程实现里 Home 是独立的按钮输入，
+不依赖键盘映射。
+
+**VNC 与 SSH 都不装了**。这不是功能缩水：`vphone.sock` 和 HTTP API 都在
+**不需要 guest 网络**的情况下工作，因此 `tunnel` 模式下照样可用；
+而 dropbear/trollvnc 依赖 guest 网络栈和端口转发。
+
+**关于可选越狱**：原文这一步是「装 Procursus + ElleKit / Sileo」。
+vphone-cli 的公开工作流**不装任何 bootstrap**，`cfw install` 只往 `/usr/lib` 放它自己的
+hook dylib，注入靠 `launchdhook-vphone` + `SystemHook-vphone` 这条自建链，
+不需要 ElleKit。如果确实需要包管理器，走的是另一个入口：
+
+```sh
+# 菜单栏 Apps > Install Bootstrap…，选 roothide（rootless 已弃用）
+# 然后在 Irisin 里装 owngoal-bootstrap-vphone
+```
+
+> 注意这里的取舍：`owngoal-bootstrap-vphone` 是一次装齐 apt/dpkg/bash/zsh/sudo/
+> openssh-server 等全套，因为其中几个包互相依赖、`openssh-server` 甚至有循环依赖，
+> 逐个装会中途失败。这和原文「先装 Procursus 再补 basebin」是同一个坑的两种解法。
 
 ---
 
@@ -1981,6 +2404,48 @@ ssh root@127.0.0.1 -p2222 halt
 它明确把本 writeup 列为致谢来源，可以理解为本文所讲内容的「工程化重做版」。
 **想学习原理 → 读本文；想快速用 → 上 vphone-cli。**
 
+**vphone-cli 对应实现**（详见 [17.3](#173-固件准备fw-prepare--firmware-preparation) 与 [17.14](#1714-与本文手工流程的逐条对照--writeup-vs-implementation)）
+
+原文的兼容性是「我试过这两台机器能用」，vphone-cli 把它变成了一张**会更新、会拒绝**的表。
+
+**（1）cloudOS 侧的窗口变了**
+
+原文锁定的 cloudOS 是 `26.1 (23B85)`。vphone-cli 现在能用的是 **`26.4-23E5207q`（beta）及更早**，
+因为 Apple 在之后的版本里删掉了 `vphone600ap`：
+
+| cloudOS | `vresearch101ap` | `vphone600ap` |
+| --- | --- | --- |
+| `26.4-23E5207q` (beta) | 有 | **有** |
+| `26.4-23E244` 及之后全部 | 有 | 无 |
+
+`vphone-cli fw catalog` 可以查当前目录里哪些组合可用；`fw prepare` 会在解包前拒绝
+没有 `vphone600ap` 的镜像。
+
+**（2）iPhone 侧反而变宽了**
+
+原文只能配 iPhone 16（iPhone17,3）。vphone-cli 已经验证过的组合包括
+iPhone 17 Pro / Pro Max、iPhone 18 Pro，以及多款 iPad（iPad mini A17 Pro、
+iPad A16、iPad Air M3、iPad Pro M4/M5）。差别在于原文的偏移是写死的，
+vphone-cli 是语义定位，所以能跟着固件走。
+
+**（3）一条原文没有的硬限制**
+
+iPhone18,1 和 iPhone18,2 在 iOS 27 上**必须**开 `kernel-boot-shared_region_size`。
+原因是它们的 dyld shared cache 记录了 `sharedRegionSize = 0x185804000`
+（27.0.1），比 cloudOS 26.4 内核的 `0x180000000` 共享区还大，即使把 slide 去掉也映射不进去，
+launchd 会在首次启动 panic 并报 `Library not loaded: /usr/lib/libSystem.B.dylib`。
+iPhone17,3 的 27.0.1 cache 是 `0x17D508000`，塞得下。
+
+这条限制在工程实现里是**前置拒绝**：`cfw install` 会拿 cache 的实际尺寸去比内核的共享区，
+放不下就直接说原因，不会留下一个一启动就 panic 的 guest。
+
+**（4）宿主侧**
+
+原文说「预计任何支持 `pccvre` 的机型都可以」。vphone-cli 的硬要求是
+**实体 Apple Silicon Mac + macOS 15 或更新**，并且明确指出
+**PV=3 guest 不能在 macOS 虚拟机里嵌套运行**。这一条原文没有写，
+但确实是很多人在 VM 里试然后卡住的原因。
+
 ---
 
 ## 15. 在 Sequoia 上启用触摸交互 / Enabling Touch Interaction on Sequoia
@@ -2005,6 +2470,46 @@ ssh root@127.0.0.1 -p2222 halt
   发给虚拟机。
 - 在 Tahoe 26 上不需要它（系统直接支持）。
 
+**vphone-cli 对应实现**（详见 [17.7](#177-虚拟机运行--running-the-vm)「（3）触摸」）
+
+原文这段 `ScreenSharingVNC.swift` 是整套研究里少数公开了完整源码的部分，
+vphone-cli 的 `VPhoneVirtualMachineView` 是它的直系后代，连代码注释都引用了它：
+
+```swift
+// VPhoneVirtualMachineView.swift:125
+/// https://github.com/wh1te4ever/super-tart-vphone-writeup/blob/main/contents/ScreenSharingVNC.swift
+private var multiTouchDevice: AnyObject? {
+    guard let vm = virtualMachine else { return nil }
+    guard let devices = Dynamic(vm)._multiTouchDevices.asObject as? NSArray,
+          devices.count > 0 else { return nil }
+    return devices.object(at: 0) as AnyObject
+}
+```
+
+拿触摸设备的方式一样，都是 `Dynamic(vm)._multiTouchDevices` 取第一个。
+但它没有停在「重写鼠标事件」，而是把这套重写扩成了一个完整的输入模型：
+
+| 宿主输入 | guest 侧行为 |
+| --- | --- |
+| 左键点击 | 单指触摸（phase 0 按下 → 3 抬起） |
+| 右键 | iPhone：触摸长按（模拟 iOS 的上下文菜单）；iPad：真正的第二键 |
+| 滚轮 / 触控板双指 | 合成一根手指拖动，或走原生 `input.scroll`（带 AppKit 动量淡出） |
+| 双指捏合 | 两根合成手指做 pinch |
+| 拖文件进窗口 | 文件传输进 guest |
+| ⌘C / ⌘V | 走 guest 剪贴板 |
+| Esc | iPhone：返回手势；iPad：真正的 Esc |
+
+两个原文没有提到、但实测必须处理的细节：
+
+- **触摸更新被限制在约 70 Hz**。每帧都发会让 guest 里的触摸变成抖动；
+- **翻页与滚动的边界处理**。guest 会把手指钳在屏幕边缘，一旦钳住，
+  继续累加的位移就丢了，所以代码里维护了 `scrollOverflow` 在回到屏内时补回去。
+
+原文第 13 节提到「Sequoia 上只靠 `VZVirtualMachineView` 无法触摸」，
+vphone-cli 的做法确实是重写 `mouseDown` / `mouseDragged` / `mouseUp` 一族，
+不过它同时用 `_VZUSBTouchScreenConfiguration` + `_setMultiTouchDevices` 把触摸设备挂上去，
+两者配合才成立。
+
 ---
 
 ## 16. 项目源码 / Project SRC
@@ -2023,6 +2528,1248 @@ ssh root@127.0.0.1 -p2222 halt
 
 - 该仓库里有本文所有步骤对应的**可运行脚本**（`CFW/*.py`、`boot_rd.sh`）与 `GUIDE.md`。
 - 注意：**仓库现已归档（只读）**，最后一次提交为 2026-02-25。
+
+**vphone-cli 对应实现**
+
+原文在这里只列了一个仓库地址，而且该项目**已于 2026-02-25 归档**。
+vphone-cli 是它之后仍在维护的实现，两者的关系可以直接用目录对上：
+
+| 原文的项目结构 | vphone-cli 的对应 |
+| --- | --- |
+| `CFW/patch_fw.py`、`patch_fw.py` 里的补丁函数 | `VPhoneExecutable/VPhoneCommand/FirmwarePatcher/`（Swift，9 个 patch set） |
+| `CFW/fix_boot.py` | `VPhoneCommand/Firmware/VPhoneCustomFirmwareInstaller.swift` |
+| `CFW/get_rd.py` + `boot_rd.sh` | 不再需要（改为宿主机离线挂载磁盘） |
+| `CFW/get_fw.py` | `VPhoneCommand/Firmware/VPhoneFirmwarePreparer.swift` |
+| 改造过的 `super-tart`（`VM.swift`） | `VPhoneExecutable/VPhoneVirtualization/` |
+| 改造过的 `libirecovery` | `VPhoneCommand/VPhoneRestore/MobileRecoveryCore`（vendored） |
+| `CFW/custom_26.1/*.plist` | 由 `fw prepare` 在 Swift 里重新生成 |
+| `contents/ScreenSharingVNC.swift` | `UI/VirtualMachine/VPhoneVirtualMachineView.swift` |
+| `GUIDE.md` 里的越狱步骤 | 移出项目范围（见[第 13 节](#13-第二次启动尝试--second-boot-attempt)） |
+
+规模上也不是一个量级：原文的产出是几个 Python 脚本加一份 GUIDE，
+vphone-cli 是 712 个 Swift 文件、213 个 C / Objective-C 文件，
+运行时不需要 Xcode、Python 或 Homebrew，
+产出是一个签名过的 `VPhone.bundle`。
+
+拆解细节见新增的[第 17 节](#17-vphone-cli-实现剖析--implementation-deep-dive)，
+如果只想尽快用起来，[17.15](#1715-复现命令速查--command-cheat-sheet) 有命令速查。
+
+---
+
+## 17. vphone-cli 实现剖析 / Implementation Deep Dive
+
+**原文 · 译文（逐行对照）**：本节为本文新增，原 writeup 无对应内容。
+
+**中文解读**：前面 16 节讲的是「一个人怎么用 Python 脚本 + 改造过的 tart 把虚拟 iPhone 拼出来」。
+本节讲的是**同一件事被工程化之后长什么样**，也就是 [Lakr233/vphone-cli](https://github.com/Lakr233/vphone-cli)
+的源码实现。它不是本文的替代品，而是本文的**答案对照表**：你在这里能读到「原作者手工敲的
+那条 `patch_fw.py`，在工程实现里对应哪个文件、用什么策略重新定位、为什么不再硬编码偏移」。
+
+> 本节所有结论均来自对 vphone-cli 仓库的**直接读码**，基线为 commit `aa76eef8`
+> （2026-10-21），Launchpad 版本 `2.10.1`。仓库在持续演进，若与最新代码有出入，
+> **以仓库为准**（和本文其他部分的约定一致）。
+
+### 17.1 一句话结论与规模 / Scale
+
+**中文解读**：
+
+一句话：**vphone-cli 把本文的「一次性脏活」重写成了一个零运行时依赖的 Swift 产品，
+并且把其中最脆弱的环节（硬编码文件偏移）全部换成了「按语义重新定位」。**
+
+先看规模，这决定了它不可能靠读几个文件就理解：
+
+| 指标 | 数值 | 说明 |
+| --- | --- | --- |
+| Swift 源文件 | **712** 个 | 约 174,000 行 |
+| C / Objective-C / 头文件 | **213** 个 | 恢复后端（vendored）+ guest 侧 hook dylib |
+| Markdown 文档 | **149** 个 | `Research/` 下每个补丁都有独立研究记录 |
+| Python 文件 | **0** 个 | `git ls-files '*.py'` 返回空，这是仓库的**常驻检查项** |
+| 顶层模块 | 5 个 | `VPhoneExecutable` / `VPhoneKit` / `VPhoneDaemon` / `VPhoneGuestComponents` / `VPhoneLaunchpad` |
+
+对比本文：本文的产出是 `CFW/*.py` + `boot_rd.sh` + 一份 GUIDE；vphone-cli 的产出是
+一个**签名过的 `VPhone.bundle`**，运行时不需要 Xcode、Python 或 Homebrew。
+
+**为什么「零 Python」值得单列**：本文的 `patch_fw.py`、`fix_boot.py`、`get_rd.py` 都依赖
+`pyimg4`、`requests` 等第三方包，而依赖链本身会漂移。vphone-cli 把 `pyimg4` 换成
+`libimg4-spm`、把 keystone 汇编器换成预生成常量 + Capstone 校验、把 `ipsw` 的 AEA/IM4P
+功能换成自研命令（`fw aea-key`、`fw im4p-create`），目的是让「一个 bundle 拷到别人的
+干净 Mac 上就能跑」。
+
+### 17.2 进程与产物结构 / Processes and Bundle Layout
+
+**中文解读**：
+
+**（1）为什么拆成两个可执行文件**
+
+这是本文完全没有的一层设计，也是理解 vphone-cli 的入口。本文的做法是把
+`AVPBooter` 拷进虚拟机目录再打补丁，宿主侧只需要「关 SIP / 关 AMFI」；vphone-cli
+则要面对一个更严格的现实：**带 Apple 私有 entitlement 的 ad-hoc 签名二进制，amfid 会直接拒绝，
+内核在 exec 阶段就把它杀掉**。
+
+于是它做了**二进制拆分**：
+
+| 二进制 | entitlement | 职责 |
+| --- | --- | --- |
+| `vphone-cli` | **无** | 参数解析、编排。在任何 Mac 上都能启动 |
+| `vphone-vm` | **6 项 entitlement**（含 3 项 `com.apple.private.*`） | 唯一持有虚拟化权限的进程，跑 `NSApplication` + `VZVirtualMachine` |
+| `vphone-escalator` | 无（需 root） | 只负责 AMFI cdhash 准入，见 [17.11](#1711-安全模型与权限边界--security-model) |
+
+`vphone-vm` 的 entitlement 清单（`VPhoneExecutable/VPhoneVirtualization/Resources/VPhoneVirtualization.entitlements`）：
+
+```
+com.apple.private.bmk.allow
+com.apple.private.virtualization
+com.apple.private.virtualization.security-research
+com.apple.security.get-task-allow
+com.apple.security.virtualization
+com.apple.vm.networking
+```
+
+关键点：`com.apple.private.virtualization.security-research` 就是「允许运行 PCC 研究用
+虚拟机（PV=3）」的那一项。`vphone-cli` 自己**一项都没有**，所以它永远能启动，
+也就永远能在 amfid 拒绝 `vphone-vm` 时**把原因和解决办法打印出来**，
+这解决了本文读者最痛苦的一类问题：`Killed: 9` 且没有任何输出。
+
+`vphone-cli` 的 `main.swift` 因此只有 40 行，核心逻辑是：
+
+```swift
+// VPhoneExecutable/VPhoneCommand/VPhoneCommand/main.swift:23-37
+let command = try VPhoneCommand.parseAsRoot()
+switch command {
+case let boot as VPhoneBootCommand:
+    // `boot` 不是本进程的活，交给 vphone-vm
+    let status = try VPhoneGuestLaunchPlanner().run(boot.bootArguments)
+    if status != 0 { throw ExitCode(status) }
+default:
+    var runnable = command
+    try runnable.run()
+}
+```
+
+注意 `VPhoneBootCommand` 的定义在 **`VPhoneCoreKit`** 里，被 `vphone-cli` 和 `vphone-vm`
+**共享同一份声明**。这样 `vphone-cli boot --help` 与 `vphone-vm --help` 不可能漂移，
+`--dfu` 之类的语义天然一致。这是本文的「手工改 super-tart」无法保证的一致性。
+
+**（2）`VPhone.bundle` 的目录布局**
+
+```
+VPhone.bundle/Contents/
+├── MacOS/                       # 宿主机程序，只在 Mac 上跑
+│   ├── vphone-cli
+│   ├── vphone-vm
+│   ├── vphone-escalator
+│   └── libswiftCompatibilitySpan.vphone.dylib
+├── Frameworks/
+│   └── VPhonePatchKit.framework # 补丁 API（外部 patch set 也链接这一份）
+├── Helpers/
+│   └── VPhoneLocation.app       # 读宿主机定位的辅助 app（locationd 只认 .app 内的客户端）
+└── Resources/
+    ├── OpenAVB/OpenAVB.bin      # 开源 boot ROM
+    ├── OpenSEP/OpenSEP.bin      # 开源 SEP ROM
+    ├── patches_presets/*.plist  # 预置 patch 预设
+    └── guest-resources/         # 装进虚拟机的全部内容，绝不在 Mac 上执行
+        ├── vphoned, vphoned-tvos, vphoned.plist
+        ├── launchdhook-vphone.dylib, SystemHook-vphone.dylib
+        ├── libcamfix.dylib, libvcamcaptured.dylib, libmisfix.dylib
+        ├── libhapticsfix.dylib, libbatteryhealthfix.dylib, libdevicehubfix.dylib
+        ├── libdevicename.dylib, libprefsfix.dylib, libsigninfix.dylib
+        ├── libvphonegyro.dylib, libvphoneaccelerometer.dylib, libvphoneattitude.dylib
+        ├── libAppleParavirtCompilerPluginIOGPUFamily.dylib
+        └── VPhoneVirtIOSound.driver
+```
+
+`Contents/MacOS` 与 `guest-resources` 的分界线是**硬约束**，由构建期脚本
+`Build/ValidateBundle.sh` 强制检查：guest 目录里出现非 iOS 平台的 Mach-O 就构建失败；
+`Contents/MacOS`、`Contents/Frameworks`、`VPhoneLocation.app`、`guest-resources`
+之外出现 Mach-O 也失败。
+
+**（3）构建与签名流水线**
+
+`Build/StageBundle.sh` 是唯一产出 bundle 的地方，它做的事值得记住：
+
+1. 用 `xcodebuild` 依次构建 4 个子工程：`VPhoneRestore`（C 恢复后端）、`VPhoneCommand`
+   （CLI）、`vphoned`（**iOS SDK**）、`VPhoneEscalator`（**arm64e**）；
+2. 用 `make -C VPhoneGuestComponents all` 编译 15 个 guest dylib 与 1 个音频驱动；
+3. 检查 `vphoned` 没有引入 iOS 26 缺失的 `_swift_initBorrow` 符号（否则 guest 里会 dyld 崩溃循环）；
+4. 用 `vtool -set-build-version tvos` 从 `vphoned` 复制出 `vphoned-tvos`；
+5. **逐个二进制 ad-hoc 签名，并且只带自己的 entitlement**：
+   `vphone-vm` 带虚拟化 entitlement，`vphoned` 带 daemon entitlement，
+   `vphone-cli` / `vphone-escalator` **不带**；
+6. 最后对整个 bundle 再签一次，然后调 `ValidateBundle.sh` 验收。
+
+> 这一条对应本文 0.3 节的「关闭 SIP + AMFI」。vphone-cli 把它降级为：
+> **SIP 保持开启，只放宽调试限制**（`csrutil enable --without debug` +
+> `csrutil allow-research-guests enable`），再用 allowlist 精确放行那一个二进制。
+> 安全性上有本质区别，见 [17.11](#1711-安全模型与权限边界--security-model)。
+
+### 17.3 固件准备：`fw prepare` / Firmware Preparation
+
+**中文解读**：
+
+本文第 4、5 节讲的是「下载 iPhone 16 与 cloudOS 26.1 固件 → 解包 → 按需挑组件 → 拼 BuildManifest」。
+vphone-cli 把这一步做成 `fw prepare`，实现集中在
+`VPhoneExecutable/VPhoneCommand/VPhoneCommand/Firmware/VPhoneFirmwarePreparer.swift`。
+
+**（1）混合固件的来源分配**
+
+和本文一样是**三源混合**，但工程实现把「哪个组件来自哪个身份」写成了明确规则：
+
+| 来源 | 身份 | 提供什么 |
+| --- | --- | --- |
+| PCC `vresearch101ap` | `ComputeModule14,2` / board `0x90` | 引导链（LLB / iBSS / iBEC / iBoot）、SPTM、TXM |
+| PCC `vphone600ap` | `iPhone99,11` / board `0x91` | DeviceTree、SEP 固件、KernelCache、RecoveryMode |
+| iPhone 17,3 | `iPhone17,3` / `d47ap` | OS 镜像、trust cache、文件系统 |
+
+为什么必须这么分，`Research/Firmware/firmware_manifest_and_origins.md` 写得很清楚：
+
+- 虚拟机在 **DFU 模式**下以 `vresearch101ap`（BDID `0x90`）出现，所以
+  **BuildManifest 的签名身份必须是 vresearch101ap**，否则 TSS/SHSH 拿不到；
+- 但**运行时组件必须用 vphone600ap**：只有它的 DeviceTree 把 MKB 的 `dt` 置为 1
+  （允许无系统 keybag 启动），SEP 固件也和 vphone600 的设备树匹配。
+
+本文是靠「先解包 cloudOS，再把几个目录 copy 进 iPhone 恢复目录」来做的；vphone-cli 的
+`fw prepare` 则是在一个**一次性临时目录**里完成解包与合并，全部成功后才整体移入 VM 目录，
+中途失败不会留下半个恢复树。
+
+**（2）拒绝无效组合**
+
+`fw prepare` 会在解包前就拒绝「不可能启动」的 cloudOS。这是本文没有的一层保护：
+本文读者如果拿 cloudOS 26.4 之后的版本去试，会在 restore 阶段才炸；vphone-cli 直接说
+「这个 cloudOS 里没有 `vphone600ap`」。
+
+实测记录（`Documents/Guides/compatibility.md`）显示：**`26.4-23E5207q`（beta）是最后一个
+仍包含 `vphone600ap` 的 cloudOS**。之后的版本只剩 PCC 板与 `vresearch101ap`，
+`SupportedProductTypes` 里没有 `iPhone99,11`，也没有
+`kernelcache.*.vphone600` / `sep-firmware.vphone600` / `DeviceTree.vphone600ap`。
+
+| cloudOS | `vresearch101ap` | `vphone600ap` |
+| --- | --- | --- |
+| `26.4-23E5207q` (beta) | 有 | **有** |
+| `26.4-23E244` 及之后全部 | 有 | 无 |
+
+> 这一点直接解释了本文 14 节的「只对 26.1 有效」为什么在工程实现里变成了
+> 「只对 26.4 beta 及更早有效」，因为中间 Apple 删掉了 vphone600ap。
+
+**（3）GPU 驱动从哪来：一台用完即删的临时虚拟机**
+
+这是本文第 12 节「实现 Metal」的工程化答案，也是整套流程里最巧妙的一步。
+
+本文的做法是：手动从 cloudOS 恢复目录里翻出
+`AppleParavirtGPUMetalIOGPUFamily.bundle`，拷进 guest 的 `/System/Library/Extensions`。
+
+vphone-cli 的做法是**自动复现这个过程**：
+
+1. 建一台**无网络设备**的临时虚拟机；
+2. 启动到 DFU；
+3. 用自研的 in-process restore 后端恢复所选 cloudOS IPSW；
+4. 把恢复出来的 System 卷**只读挂载**，取出 GPU bundle；
+5. **删掉临时虚拟机**；
+6. 把 bundle 按 cloudOS build 缓存到 `~/.vphone/gpu-drivers/<version>_<build>/`。
+
+缓存的意义：同一 cloudOS 上的后续虚拟机**跳过这次临时恢复**（省一次完整 restore）。
+也可以用 `--gpu-driver-bundle /path/to/....bundle` 直接复用已有的。
+
+还有一个细节：cloudOS 的 bundle 里**没有**
+`libAppleParavirtCompilerPluginIOGPUFamily.dylib`。没有它，`MTLCompilerService` 会反复
+abort、`backboardd` 报 Metal 编译中断，**窗口全黑但 vphoned 能连上**。这正是本文 12 节
+里「黑底设置页、一操作就 respring」的现代版本。vphone-cli 的解法是：把编译器插件
+**用源码重新实现并编进 bundle**
+（`VPhoneGuestComponents/GraphicLoader/main.mm`，来自 0xjohnnydev 的 metal-patch），
+`fw prepare` 时再把它拷进暂存的 GPU bundle。
+
+### 17.4 固件打补丁：`fw patch` / Patching the Boot Chain
+
+**中文解读**：本节是本文第 6、8 节（打补丁 AVPBooter / 给固件组件打补丁）的工程化对照，
+也是整个项目**工程含量最高**的部分。
+
+**（1）流水线顺序**
+
+`FirmwarePipeline.swift` 第 5 行就把顺序写死了，和本文的手工顺序一致：
+
+```
+AVPBooter → iBSS → iBEC → LLB → TXM → Kernel → DeviceTree
+```
+
+每个组件是一个 `ComponentDescriptor`，声明：文件在恢复树里的**搜索 glob**、
+加载方式（IM4P 还是裸数据）、以及**一组 patcher 工厂**。这比本文的
+`patch(0x9D10, ...)` 多了一层抽象：同一个组件可以挂多个 patcher 顺序执行。
+
+**（2）`FirmwareOriginals/`：为什么补丁要「每次从原始字节重打」**
+
+这是本文没有、但很关键的设计。`FirmwarePipelineOriginals.swift` 在**第一次**打补丁前，
+把每个引导链组件的**未修改字节**存进 VM 目录下的 `FirmwareOriginals/`；之后每次
+`fw patch` 都从这份原始字节重新开始。
+
+为什么必须这样：
+
+- 本文的脚本是「就地改」，跑第二次会**在已打补丁的字节上再找一次模式**，
+  轻则找不到、重则改错位置；
+- vphone-cli 允许你随时开关单个补丁（见下文 patch set），关闭时必须能**回到原始字节**，
+  而不是「反向应用一遍补丁」，后者对分支类补丁几乎不可能正确。
+
+两个组件**不参与**这套机制（`restorable = false`）：`Filesystem`（Cryptex 镜像）
+与 `Manifest`（BuildManifest 哈希）。原因写在代码注释里：它们改的是「别的步骤产出的文件
+所对应的哈希」，把 manifest 单独还原会描述一个已经不存在的树。
+
+顺带一提，`fw prepare` 会主动**删除**上一个固件留下的 `FirmwareOriginals/`。理由很实在：
+`AVPBooter*.bin` 的文件名**不含版本号**，如果不删，下一次 `fw patch` 会把**上一个固件**的
+字节补完再覆盖到新固件上。
+
+**（3）Patch Set / Preset / Selection / Plan / Receipt 五层模型**
+
+这是 vphone-cli 相对本文最大的一次架构升级。本文的补丁是「脚本里按顺序调用的一串函数」，
+**没有名字、没有开关、没有记录**。vphone-cli 把它拆成五层：
+
+| 层 | 文件 | 回答什么问题 |
+| --- | --- | --- |
+| **Patch Set** | `FirmwarePatcher/PatchSets/*.swift` | 「这个 bundle 声明了哪些补丁？」（编译进二进制，共 **9 个 set**） |
+| **Preset** | `Resources/patches_presets/*.plist` | 「哪一套组合是推荐配置？」（随 bundle 发布，共 **4 个**） |
+| **Selection** | `<VM>/PatchSelection.plist` | 「这台 VM 的机主改过哪些勾？」（**只记录被改动的项**） |
+| **Plan** | `<VM>/PatchPlan.plist` | 「上一次 `fw patch` 实际解析出什么？」（含 iOS/cloudOS 版本、不适用的补丁） |
+| **Receipt** | `<VM>/PatchReceipt.plist` | 「guest 里现在真正生效的是什么？」（按 part 分组） |
+
+九个 patch set 及其职责：
+
+| Set 标识 | 内容 |
+| --- | --- |
+| `bootchain` | AVPBooter / iBSS / iBEC / LLB / TXM |
+| `kernel.base` | 内核基础补丁（APFS、启动校验、dyld 策略、sandbox） |
+| `kernel.cfw` | 内核 CFW 补丁（调试器、sandbox 扩展、内存） |
+| `kernel.hypervisor` | `hv_vmm_present` 隐藏（成对声明） |
+| `kernel.frida` | Frida Stalker 放宽（默认关闭） |
+| `devicetree` | 设备树：板型呈现、相机几何、身份重写、iPad 适配 |
+| `guest.system` | guest 用户态文件与 Mach-O（launchd、seputil、mobileactivationd…） |
+| `guest.display` | dyld shared cache 的显示相关补丁 |
+| `guest.identity` | Preboot 设备树身份重写 |
+
+**补丁标识符的命名规则**（这条规则在 `Skills/authoring-patch-sets/SKILL.md` 里有完整说明）：
+形如 `<target>-<stage>-<what>`，比如：
+
+```
+kernel-boot-apfs_root_snapshot        内核 · 引导必需 · APFS 根快照
+system-seputil-boot-gigalocker_uuid   seputil · 引导必需 · gigalocker UUID
+dyld-boot-maxslide                    dyld · 引导必需 · slide 上限
+devicetree-cfw-ipad_product           设备树 · CFW · iPad 产品信息
+```
+
+当前 bundle 里**声明的补丁共 158 个**。一个声明可以覆盖多个写入点：比如
+`kernel-boot-sandbox_ext` 一个标识符覆盖全部 `kernel-boot-sandbox_ext.<index>` 记录，
+`kernel-boot-kcall10` 一个标识符覆盖它的 4 条记录。
+
+**四个预置**（`Resources/patches_presets/`）：
+
+| 预设 | 用途 |
+| --- | --- |
+| `standard` | 默认。**屏蔽 20 个补丁**：2 个 Frida 放宽、3 个 `hv_vmm_present` 隐藏、8 个设备树身份重写、Preboot 身份重写、`mis_trust_auth`、Settings 行隐藏、Software Update 行、tvOS 相关 |
+| `experimental` | 不屏蔽任何补丁 |
+| `tvos` | 标准 + 两个 TV TPRO 补丁，关掉 iOS 的显示/相机/音频/传感器/GPU 补丁 |
+| `tvos-4k` | `tvos` + GPU bundle + OTA userland 替换 |
+
+`standard` 为什么默认关掉 `hv_vmm_present` 隐藏？研究记录写得很直接：**它会让刚恢复的
+26.4 guest 直接变砖**。`bluetoothd` 把 `sysctlbyname("kern.hv_vmm_present")` 的答案缓存进
+`dispatch_once`，拿到 ENOENT 后缓存 0，芯片选择单例匹配不到虚拟 iPhone 就 NULL 解引用、
+crash-loop；`locationd` 又同步阻塞在这个被 throttle 的 XPC 上，
+`com.apple.locationd.migrator` 卡住，SpringBoard 等迁移，结果是**黑屏，无 panic**。
+
+> 这条是本文读者最容易踩的坑：本文附录 A 里没有 `hv_vmm_present` 系列补丁，
+> 而 vphone-cli 曾经把它设为默认开启，然后被真实故障打了回来。
+
+**（4）漂移检测（drift）**
+
+`FirmwarePatchDrift.swift` 把上面三个记录（selection / plan / receipt）做**纯函数比较**，
+回答「我勾的这个补丁，到 guest 里了没有」。它同时定义了**四种投递方式**：
+
+| 投递方式 | 适用补丁 | 机制 |
+| --- | --- | --- |
+| `fw-patch` | AVPBooter | 文件在 VM 目录里，每次启动读取，重打即可 |
+| `update-kernel` | KernelCache | 从 `FirmwareOriginals` 重打，把 IM4P 换进 Preboot，**不擦数据** |
+| `restore` | iBSS / iBEC / LLB / TXM / DeviceTree | 只能重新恢复（擦除式） |
+| `update-environment` | DSC / guest 可执行文件 / entitlement / plist / Preboot DT | `cfw install` 或环境更新写入 |
+
+这套「改一个补丁需要多重的一步」的建模，是本文完全没有的。
+本文读者改一个内核偏移后只能整机重恢复。
+
+**（5）补丁定位：从「硬编码偏移」到「语义锚点」**
+
+这是本节最值得本文读者学习的一点。本文附录 A 的表格是这样的：
+
+| 组件 | 偏移 | 补丁 |
+| --- | --- | --- |
+| iBSS | `0x9D10` / `0x9D14` | `nop` / `mov x0,#0` |
+| kernel | `0x2476964` | `nop` |
+
+vphone-cli **禁止**这种写法。`AGENTS.md` 的「Kernel patcher guardrails」把它列为硬性规则：
+
+> - 绝不在补丁逻辑里硬编码文件偏移、虚拟地址或预汇编指令字节。
+> - 所有指令匹配必须来自 Capstone 解码结果（mnemonic / operands / control flow），
+>   能语义判断时不要用格式化后的操作数字符串。
+> - 所有替换字节必须来自 `ARM64Encoder.encode*` 或 `ARM64` 常量，**绝不写指令字面量**。
+
+它用的定位手法有三类：
+
+1. **字符串锚点 + ADRP+ADD 交叉引用**：找 `"display-scale"` 字面量，回溯加载它的
+   ADRP+ADD，再匹配后面的 `ubfx / add / str` 序列；
+2. **指令模式 + 上下文打分**：比如 iBSS 的 image4 回调补丁，找 `b.ne` 紧跟 `mov x0, x22`、
+   且前 8 条指令内有 `cmp` 的位置；再用「前 64 条内是否有 `movn w22, #-1`」给候选**打分**，
+   优先选错误返回路径那个；
+3. **调用图相关性**：内核补丁通过 `bl` 调用频次、panic 字符串、XNU 源码语义来确认
+   函数身份（比如 `bsd_init` 的 rootvp panic 块 → 唯一的 `call` → `cbnz` → `bl imageboot_needed`）。
+
+具体例子（本文附录 A 的 iBSS 第一条补丁在工程实现里的样子）：
+
+```swift
+// FirmwarePatcher/IBoot/BasePatches/IBootPatchImage4Callback.swift
+// 找 b.ne + mov x0, x22，且前面 8 条内有 cmp
+guard a.mnemonic == "b.ne" else { continue }
+guard b.mnemonic == "mov", b.operandString == "x0, x22" else { continue }
+let hasCmp = insns[lookback ..< i].contains { $0.mnemonic == "cmp" }
+// 打分：前 64 条内出现 movn w22 / mov w22,#-1 的优先
+emit(off,     ARM64.nop,     id: "\(component)-boot-image4_callback.bne")
+emit(off + 4, ARM64.movX0_0, id: "\(component)-boot-image4_callback.mov")
+```
+
+对比本文的 `patch(0x9D10, nop)`：**偏移一个都不写**，但效果完全一致，
+而且换固件版本时**自动重定位**。这就是为什么 vphone-cli 能支持 iOS 26.0 到 27.0.1
+这么宽的范围，而本文只能锁定 26.1。
+
+还有一个细节值得注意：boot-args 字符串**和本文完全一样**：
+
+```swift
+// IBoot/IBootPatcher.swift:30
+static let bootArgs = "serial=3 -v debug=0x2014e %s"
+```
+
+这说明本文的结论是对的，工程实现只是换了找位置的方法。
+
+### 17.5 恢复固件：`restore` / In-Process Restore
+
+**中文解读**：本文第 7、9 节讲的是「改造并编译 libirecovery → 抓 SHSH → 用
+`idevicerestore` 恢复」。vphone-cli 把这一整条链**搬进了自己的进程**。
+
+**（1）不再需要外部工具**
+
+本文需要：
+
+- 改造版 `wh1te4ever/libirecovery`（支持 `vresearch101ap`）；
+- Homebrew 或源码编译的 `idevicerestore`；
+- `iproxy`（SSH ramdisk 阶段）；
+- `python3` + `pyimg4` + `requests`。
+
+vphone-cli 的 `vphone-cli restore` 在**当前进程内**完成恢复，底层是两份 vendored C：
+
+| 目录 | 来源 | 作用 |
+| --- | --- | --- |
+| `VPhoneRestore/MobileRecoveryCore` | libirecovery | DFU/恢复模式 USB 通信、IMG4 上传 |
+| `VPhoneRestore/MobileRestoreCore` | idevicerestore | 恢复流程编排、组件发送、ASR |
+| `VPhoneRestore/VPhoneRestore` | 本项目 Swift（约 1,000 行） | 桥接、进度、错误 |
+
+`libimobiledevice` / `libplist` / `libusbmuxd` / `libtatsu` / OpenSSL 这些**没有** vendored，
+而是通过 `Lakr233/AppleMobileDeviceLibrary` 提供的预编译静态 xcframework 链接进来。
+研究记录算过账：那 5 个库加起来 73,193 行，属于「本项目永远不会读也永远不会改」的代码。
+
+**（2）`openavb.c`：本文没有的一段 DFU 协议**
+
+这是 OpenAVB 带来的**新增实现**，也是本文「打补丁 AVPBooter」在工程实现里的替代路径。
+
+OpenAVB **不携带任何 iBoot 版本信息**，所以它拒绝通过 DFU 接收 iBSS，
+除非宿主先把「这张镜像是什么」告诉它。`MobileRestoreCore/Recovery/openavb.c` 在发送 iBSS 之前：
+
+1. 用**只读**报告请求（`0xc0 0x73`，48 字节）探测 ROM 类型。
+   **Apple 的 ROM 会让这个请求 stall**，于是什么都不会写；这就是区分两种 ROM 的方法；
+2. 从个性化后的 iBSS 构造 112 字节的 `AVPPatchStageHeader`：
+   遍历 IMG4 → IM4P → 第一个 OCTET STRING，要求 `bvx2` 压缩，
+   用 libcompression 解压，从偏移 `0x300` 读出 iBoot 链接基址
+   （vresearch101 是 `0x7006c000`），entry level 2；
+3. 打开 stage（`0x41 0x70`）→ 追加数据块（`0x41 0x71`）→ 封口（`0x41 0x72`，0 行）；
+4. 再报告一次，要求 stage 0 返回 `{0, 112, sealed}`。
+
+> 这意味着一个连带改动：OpenAVB **只解 LZFSE**，所以 `fw patch` 现在把 iBSS
+> 按 LZFSE 写回（和 Apple 原厂一致，Apple 的 ROM 也接受）。
+> 本文读者如果自己写脚本重打包 iBSS，这一点必须注意。
+
+**（3）SHSH / 离线恢复**
+
+`vphone-cli restore` 的关键 flag：
+
+| Flag | 作用 |
+| --- | --- |
+| `--get-shsh` / `-t` | 只抓签名票据，不恢复 |
+| `--offline` / `-O` | 离线恢复：就地解密 AEA 镜像，使用缓存的 `.shsh` |
+| `--ecid` | 指定 ECID（默认从 bundle 的 `udid-prediction.txt` 读） |
+| `-v` / `-vv` / `-vvv` | 工具细节 / guest 串口 / 内部 trace |
+
+在线恢复在进程内取票，等价于本文的 `tsschecker` / `idevicerestore -t`。
+
+**（4）一个明确「不支持」的选项**
+
+`--no-erase` 这个 flag **存在但被拒绝**，而且拒绝理由写进了代码注释：
+在 iPhone 27.0 (24A435) + cloudOS 26.4 上实测，就地恢复失败三次：
+
+1. 混合 manifest 没有 Upgrade 身份，系统卷写完后就失败；
+2. 即使补一个，cloudOS 的恢复 ramdisk（vphone guest 唯一能启动的 ramdisk）
+   仍会重建分区图与系统 keybag，**擦掉 Data 卷**；
+3. iPhone 的 update ramdisk 在 cloudOS 恢复内核上 panic（initproc exits）。
+
+保留这个 flag 是为了「让用它的脚本拿到这个原因，而不是一个用法错误」。
+这种「把失败实验固化成明确的拒绝」的做法，值得本文读者学习。
+
+### 17.6 CFW 安装：`cfw install` / Guest System Installation
+
+**中文解读**：本节对应本文第 10、13 节，即用 SSH Ramdisk 进去补 Cryptex、装 Sleigh/ElleKit、
+打 `fix_boot.py` 那些补丁。vphone-cli 把「进 ramdisk 手工改」换成了
+**宿主机离线挂载磁盘**，实现集中在
+`VPhoneExecutable/VPhoneCommand/VPhoneCommand/Firmware/VPhoneCustomFirmwareInstaller.swift`
+（3,000+ 行）。
+
+**（1）三种模式**
+
+| 模式 | 做什么 | 需要恢复树 |
+| --- | --- | --- |
+| `full` | 完整安装：Cryptex、GPU bundle、全部 DSC 与 Mach-O 补丁、guest payload | 需要 |
+| `environmentOnly` | 只把 bundle 里的 guest 文件（vphoned、dylib、音频驱动）覆盖回原位 | **不需要** |
+| `kernelUpdate` | 只换 Preboot 里的 kernelcache IM4P | 不需要 |
+
+`environmentOnly` 的存在理由很有意思：恢复树在 VM 首次启动后就被删了，
+所以「给一台正常使用的 VM 更新一个 guest dylib」**没有别的路径**：
+通过 API 替换运行中 guest 的文件，改不了已经被守护进程映射的库。
+
+**（2）root 与安全边界**
+
+`cfw install` **需要 root**（`sudo` 或 Launchpad 的 helper）。它面对的是一个
+「调用者完全可控、权限 0777」的目录 + 一个「内容可能被 guest 或导入改过」的 `Disk.img`，
+所以代码里有一整套防御，值得单列：
+
+- bundle 只按**文件描述符**固定一次，之后**绝不用路径重建**；
+- `Disk.img`、恢复树、Cryptex 镜像必须是**调用者拥有的普通单链接文件**，
+  只在 root-only 工作目录里挂载**私有副本**；
+- guest 卷挂载在 0700 目录内，**所有 guest 读写都走 `VPhoneConfinedDirectory`（相对描述符）**，
+  这样 guest 内的符号链接永远无法把 root 指向宿主机路径；
+- root 只按描述符交回自己创建的文件，**从不遍历调用者目录去 chown/chmod**。
+
+工作目录默认 `/private/var/tmp`（root 拥有、sticky），用 `mkdtemp` 创建，
+名字不可预测。可以用 `--work-parent` 改。
+
+**（3）磁盘操作流程**
+
+1. 用 `lsof` 确认没有别的进程打开 `Disk.img`（`vm stop` 之外，Spotlight / 备份工具也会占）；
+2. 在私有工作目录里对 `Disk.img` 做 **APFS clone**，改完再整体 rename 覆盖原文件，
+   所以**失败时原盘不动**；
+3. `diskutil image attach -noMount` 挂载镜像；
+4. 挂载 guest 卷，执行 Cryptex / GPU / DSC / Mach-O / plist 各项补丁；
+5. 写完 `PatchReceipt.plist`，卸载、eject。
+
+> 注意 macOS 27 的一个坑：`diskutil image attach` 现在会先打印它合成的 APFS
+> container，再打印镜像自己的 disk。代码里专门处理了这一点：取
+> `Apple_APFS` 分区的**父盘**，否则后续所有设备引用都会指向 container 而不是镜像。
+
+**（4）Cryptex 与封卷**
+
+本文第 10 节的核心难点是：SSV 把根卷封了，改文件就 panic，所以要用 SSH Ramdisk 把
+`SystemOS` / `AppOS` 两个 Cryptex 补进去。vphone-cli 用
+`FirmwarePatcher/CryptexFilesystem/` 下的 7 个文件完成同一件事：
+
+- `CryptexFilesystemPatcherAEA.swift`：AEA 解密
+- `CryptexFilesystemPatcherDiskImage.swift`：磁盘镜像操作
+- `CryptexFilesystemPatcherSealing.swift`：**重新封卷**
+- `CryptexFilesystemPatcherManifest.swift`：更新 BuildManifest 里的哈希
+- `CryptexFilesystemPatcherGuestPayload.swift`：写入 guest payload
+- `CryptexFilesystemPatcherFileOps.swift`：文件级操作
+- `CryptexFilesystemPatcherProcess.swift`：流程编排
+
+**（5）`orig-fs` 快照**
+
+本文用 `snaputil -n` 处理根快照，vphone-cli 用 `cfw flip-snapshot`：
+离线重命名 APFS 里 `com.apple.os.update-<hash>` 这个快照，
+让「封卷校验被 patch 掉的内核」找不到具名根快照，转而从 live volume 起。
+
+两个实现细节：**只改 APFS 校验和验证通过的块内记录**（所以卷上二进制里
+相同的字符串不会被误改）；**完全离线**，不挂载、不调 `fs_snapshot` 系统调用。
+
+**（6）可逆：`.bak` 机制**
+
+这是本文完全没有的能力。`patchCopy` 在第一次改动某个 guest 文件时，
+把**改动前**的字节存成 `<file>.bak`，之后**永不覆盖**。于是：
+
+- 关闭某个补丁时，可以**真的还原**成原始字节；
+- 但只有「本次运行前没有其他补丁碰过这个文件」时才存 `.bak`，
+  否则存下来的就是「已打过补丁的字节」，会被误当成原始文件；
+- 早于这个机制打补丁的文件没有 `.bak`，代码会**明确报告不可还原**，而不是猜。
+
+### 17.7 虚拟机运行 / Running the VM
+
+**中文解读**：本节对应本文第 3 节（改造 super-tart）和第 15 节（触摸交互）。
+
+**（1）PV=3 硬件模型**
+
+本文的 `vzHardwareModel_VRESEARCH101()` 在工程实现里几乎是**逐行对应**的：
+
+```swift
+// VPhoneExecutable/VPhoneVirtualization/UI/VirtualMachine/VPhoneVirtualMachineHardwareModel.swift:19-35
+static func createModel() throws -> VZMacHardwareModel {
+    let desc = Dynamic._VZMacHardwareModelDescriptor()
+    desc.setPlatformVersion(NSNumber(value: UInt32(3)))   // PV=3
+    desc.setBoardID(NSNumber(value: UInt32(0x90)))        // vresearch101
+    desc.setISA(NSNumber(value: Int64(2)))
+    let model = Dynamic.VZMacHardwareModel
+        ._hardwareModelWithDescriptor(desc.asObject).asObject as! VZMacHardwareModel
+    guard model.isSupported else { throw ... }
+    return model
+}
+```
+
+注释里还写了 entitlement 的门槛（这是本文没有的信息）：
+
+```
+default_configuration_for_platform_version(3) 的有效性字节 =
+    (entitlements & 0x12) != 0
+    位 1 = com.apple.private.virtualization
+    位 4 = com.apple.private.virtualization.security-research
+```
+
+**（2）设备清单**
+
+`VPhoneVirtualMachine.swift` 组装的配置，可以看成「一台虚拟 iPhone 由哪些虚拟硬件构成」的
+完整清单。标 **私有** 的需要 `Dynamic()` 走运行时方法派发：
+
+| 类别 | 配置类 | 备注 |
+| --- | --- | --- |
+| 平台 | `VZMacPlatformConfiguration` + 私有硬件模型 | machineIdentifier 即 ECID 来源 |
+| 引导 | `VZMacOSBootLoader` + **私有** `_setROMURL` | 换 OpenAVB / Apple ROM |
+| 显示 | `VZMacGraphicsDeviceConfiguration` | 默认 1290×2796 @ 460 ppi，scale 3.0 |
+| 音频 | `VZVirtioSoundDeviceConfiguration` | 输入 + 输出流，宿主音频源/汇 |
+| 存储 | `VZVirtioBlockDeviceConfiguration` | `Disk.img` |
+| 网络 | `VZNetworkDeviceConfiguration` | nat / bridged / tunnel / none |
+| 串口 | **私有** `_VZPL011SerialPortConfiguration` | 双向管道，用于启动检测与 `-v` 日志 |
+| 加速器 | **私有** `_VZMacVideoToolboxDeviceConfiguration`、`_VZMacNeuralEngineDeviceConfiguration`、`_VZMacScalerAcceleratorDeviceConfiguration` | 硬解 / ANE / 缩放器 |
+| 触摸 | **私有** `_VZUSBTouchScreenConfiguration` + `_setMultiTouchDevices` | 见下文 |
+| 键盘 | `VZUSBKeyboardConfiguration` | 可在 manifest 里关掉 |
+| 熵 | `VZVirtioEntropyDeviceConfiguration` | |
+| 电池 | **私有** `_VZMacSyntheticBatterySource` + `_VZMacBatteryPowerSourceDeviceConfiguration` | 固定 100%、充电中 |
+| 调试 | **私有** `_VZGDBDebugStubConfiguration` | 内核 GDB stub，默认系统分配端口 |
+| 协处理器 | **私有** `_VZSEPCoprocessorConfiguration` | SEP + `SEPStorage` + SEP ROM |
+| 控制通道 | `VZVirtioSocketDeviceConfiguration` | VSOCK，vphoned 走这里 |
+
+**（3）触摸：本文 `ScreenSharingVNC.swift` 的直系后代**
+
+这是本文与 vphone-cli 之间**最直接的血缘关系**，代码注释里就挂着本文的链接：
+
+```swift
+// VPhoneVirtualization/UI/VirtualMachine/VPhoneVirtualMachineView.swift:125
+/// https://github.com/wh1te4ever/super-tart-vphone-writeup/blob/main/contents/ScreenSharingVNC.swift
+private var multiTouchDevice: AnyObject? {
+    guard let vm = virtualMachine else { return nil }
+    guard let devices = Dynamic(vm)._multiTouchDevices.asObject as? NSArray,
+          devices.count > 0 else { return nil }
+    return devices.object(at: 0) as AnyObject
+}
+```
+
+本文第 15 节说「Sequoia 上必须重写鼠标事件函数」，vphone-cli 的
+`VPhoneVirtualMachineView` 正是这么做的，并且把它扩成了**完整的输入模型**：
+
+| 宿主输入 | guest 侧效果 |
+| --- | --- |
+| 左键点击 | 单指触摸（phase 0 → 3） |
+| 右键 | iPhone：触摸长按；iPad：真正的第二键 |
+| 滚轮 / 触控板双指 | 合成一根手指拖动，或原生 `input.scroll`（带动量淡出） |
+| 双指捏合 | 两根合成手指做 pinch |
+| 拖拽文件进窗口 | 文件传输进 guest |
+| ⌘C / ⌘V | 走 guest 剪贴板 |
+| Esc | iPhone：返回手势；iPad：真正的 Esc |
+
+一个很细的工程点：触摸更新被限制在约 70 Hz（`scrollLastSend`），
+因为「每帧都发」在 guest 里会让触摸变成抖动。
+
+**（4）OpenAVB / OpenSEP：本文「打补丁 AVPBooter」的终点**
+
+本文第 6 节整节都在讲怎么给 `AVPBooter.vresearch1.bin` 打 DGST 校验绕过补丁。
+vphone-cli 的做法是**换掉它**：
+
+| ROM | 替代 | 说明 |
+| --- | --- | --- |
+| boot ROM | [OpenAVB](https://github.com/owngoal-dev/OpenAVB) | 开源 AArch64 boot ROM，兼容 AVPBooter 契约 |
+| SEP ROM | [OpenSEP](https://github.com/owngoal-dev/OpenSEP) | 开源 SEP boot ROM |
+
+两者的意义：**在 iBoot 和 SEPOS 之前运行的代码不再出自 Apple**。
+
+工程上的连带变化：
+
+- OpenAVB **不校验镜像摘要**，所以 `avpbooter-boot-dgst_bypass` 补丁在它上面
+  **无事可做**。`fw patch` 会读 manifest 判断 ROM 类型，然后**跳过 AVPBooter 组件**，
+  打印 `Boot ROM: OpenAVB, which needs no ROM patch`；
+- 但补丁**仍然保持被选中、被规划**，这样 `fw patches` 不会报「漂移」，
+  因为机器的行为确实符合这个补丁的意图；
+- 两种 ROM **加载同一个已打补丁的 LLB**，所以「用 Apple ROM 恢复的机器」
+  可以无缝切到 OpenAVB 启动，**不需要重新恢复**：
+
+```sh
+vphone-cli vm config myphone --rom openavb --seprom opensep   # 开源 ROM
+vphone-cli vm config myphone --rom apple --seprom apple       # Apple 的 ROM
+```
+
+两个 ROM 都以**预编译**形式随 bundle 发布，构建自固定的上游 commit，
+可以用 `Build/UpdateOpenAVB.sh` / `UpdateOpenSEP.sh` 重建并**逐字节核对**。
+唯一的例外：PCC GPU 恢复用的那台临时虚拟机**保留 Apple ROM**，
+因为它恢复的是 Apple 签名的 PCC 固件，OpenAVB 没在这个场景验证过。
+
+### 17.8 guest 控制面：`vphoned` / Guest Control Plane
+
+**中文解读**：本文第 10 节里，作者「为了方便」加了三个开机自启进程：
+**bash、dropbear、trollvnc**。vphone-cli 用**一个 root 守护进程 + VSOCK** 取代了这三样。
+
+**（1）进程与传输**
+
+`vphoned` 以 launchd 守护进程运行（`VPhoneDaemon/Configuration/vphoned.plist`）：
+
+```xml
+<key>Label</key>            <string>com.vphone.vphoned</string>
+<key>ProgramArguments</key> <array><string>/usr/bin/vphoned</string></array>
+<key>RunAtLoad</key>        <true/>
+<key>KeepAlive</key>        <true/>
+<key>ProcessType</key>      <string>Interactive</string>
+```
+
+监听两个 **VSOCK** 端口（不是 TCP，不经过 guest 网络栈）：
+
+| 端口 | 用途 |
+| --- | --- |
+| **1339** | HTTP/1.1 + WebSocket（SwiftNIO），控制面 |
+| **1338** | 相机帧数据面（BGRA 帧 + 共享内存 + Darwin 通知） |
+
+启动顺序在 `main.swift` 里是有讲究的，每一步都为了「在某个系统进程读它之前」就位：
+
+```swift
+GuestLockScreenIdle.startOnStartup()        // SpringBoard 读锁屏超时之前
+GuestMobileGestaltCache.dropIfStaleOnStartup()
+GuestVirtualAudioProduct.storeOnStartup()   // audiomxd 请求声音之前
+vp_vcam_start()
+_ = vp_hid_load()                           // 预解析多指注入符号
+GuestIrisinInstaller.refreshBootstrapOnStartup()
+GuestAPI.restoreUSBSerialOnStartup()
+GuestStaticNames.shared.restoreOnStartup()
+GuestLocationdWatchdog.shared.startOnStartup()  // locationd 启动死锁时重启它
+```
+
+**（2）157 个 RPC 方法**
+
+按 `GuestAPI+<Area>.swift` 一个文件一个领域组织，共 **157 个方法名**。
+完整清单见 `Research/vphoned_http_api.md`，这里按领域概括：
+
+| 领域 | 代表方法 | 能力 |
+| --- | --- | --- |
+| 设备 | `device.info` `device.snapshot` `device.screen` `device.ioreg` `device.network` | 一次拿全状态 |
+| 输入 | `input.tap` `input.swipe` `input.drag` `input.key` `input.type` `input.touch_sequence` | 手势 / 键盘 / 指针 |
+| UI | `ui.tree` `ui.element_at` `ui.tap_element` `ui.wait` `ui.ocr` `ui.describe` | 无障碍树 + OCR |
+| 应用 | `apps.list` `apps.install` `apps.launch` `apps.terminate` `apps.remove_system` `apps.restore_system` | 含系统 App 移除/还原 |
+| 文件 | `files.list` `files.read` `files.write` `files.plist_set` `files.find` `files.chown` | 描述符相对、可 root |
+| launchd | `services.list` `services.profile.apply` `services.kickstart` `launchd.setenv` | 服务画像 |
+| 进程 | `processes.list` `processes.kill` `memory.jetsam` `memory.pressure` | |
+| 日志 | `logs.syslog` `logs.crashes` `logs.crash` | 有界抓取（≤60 s） |
+| 显示/音频 | `display.brightness` `display.rotation` `display.auto_lock` `screen.unlock` `audio.volume` | |
+| 网络 | `network.capture`（写 pcap）`network.resolve` `network.hostname.set` `network.static_names.set` | |
+| 运动 | `motion.gyroscope.set` `motion.attitude.set` | 虚拟陀螺仪 / 姿态 |
+| 位置 | `location.set` `location.current` `location.clear` | |
+| 钥匙串 | `keychain.list` `keychain.add` `keychain.database` | |
+| 设置 | `settings.get/set/delete` `clipboard.get/set/clear` | |
+| 快照 | `apfs.snapshots` `apfs.snapshot.delete` | 只允许删 `orig-fs.disabled.rn-*` |
+| 环境 | `environment.status` `environment.install` | 热更新 guest dylib |
+| Bootstrap | `bootstrap.install` `bootstrap.status` `bootstrap.uninstall` | Irisin |
+| Setup | `setup.status` `setup.skip` `setup.settle` | 跳过设置向导 |
+| 系统 | `system.reboot` `system.shutdown` `system.respring` `system.uicache` | |
+| UDID | `udid.get` `udid.set` `udid.clear` | 改 profile 看到的 UDID |
+
+**危险方法需要显式 `"force": true`**：`processes.kill`、`system.reboot`、
+`system.shutdown`、`system.respring`、`apps.uninstall`、`apps.remove_system`、
+`services.profile.apply` 等。
+
+**（3）两层访问控制**
+
+`vphoned` 以 **root** 运行，能读写任意 guest 文件、列钥匙串、加载 launch daemon。
+它的模型很坦诚：**它无法区分「被代理的连接」和「guest 自己的 VSOCK 客户端」**，
+所以两道检查分别做在两层：
+
+- **宿主代理层**：`vphone-vm` 启动时用 `SecRandomCopyBytes` 生成 32 字节 token（hex），
+  每次启动都换。可用 `VPHONE_API_TOKEN` 固定（16–256 字符，`A-Z a-z 0-9 - . _ ~`）。
+  只读前 16 KiB 请求头、最多等 10 秒，token 可以放在
+  `Authorization: Bearer`、`?token=` 查询项、或 `Sec-WebSocket-Protocol: vphone-token.<token>`。
+  **常量时间比较**；缺失/错误/超长/畸形一律 401 并直接关闭，**不会**打开 guest 连接；
+- **guest 层**：`vphoned` 自己的检查。
+
+**（4）`vphone.sock`：不经过网络的本地控制口**
+
+除了 HTTP API，每台 VM 还有一个 **Unix domain socket**：`<VM bundle>/vphone.sock`。
+协议极简：**一行 JSON 进，一行 JSON 出**，并发服务：
+
+```json
+{"t":"tap","x":100,"y":200}
+{"t":"swipe","fromX":100,"fromY":600,"toX":100,"toY":200}
+{"t":"key","name":"cmd+v"}
+{"t":"screenshot","path":"/tmp/shot.png"}
+{"t":"rpc","method":"input.type","params":{"text":"hello"}}
+```
+
+它在 `--no-graphics` 下同样存在，此时 `tap` / `swipe` 走 vphoned 的触摸注入，
+截图来自 guest 自身。**这条通道不走 guest 网络**，所以 `tunnel` 模式下照样能用。
+
+> 对比本文：作者装 dropbear + trollvnc 是为了「能操作 guest」。
+> vphone-cli 的方案在**不需要 SSH、不需要 VNC、不需要网络**的前提下提供了
+> 严格更强的能力（结构化 UI 树、OCR、钥匙串、服务画像）。
+
+**（5）相机：VSOCK 1338 + 共享内存**
+
+`libvcamcaptured.dylib` 与 `libcamfix.dylib` 的组合，把宿主摄像头画面喂给 guest：
+
+1. 宿主 `VPhoneCameraServer` 通过 VSOCK 1338 发 BGRA 帧；
+2. `vphoned` 收到后写入**序列号保护的共享内存帧** `vphone-vcam-frame.shm`，
+   再 post `com.vphone.vcam.frame`；
+3. `libvcamcaptured` 读该帧，供给 camera 客户端。
+
+所有相机运行时文件都在 `/var/mobile/Media/SimulatedCamera`。
+注意文档里明确写了：宿主窗口的 **Camera server: connected** 只证明 VSOCK 连上了，
+**不证明** camera App 或 hook 装好、加载了、出图了。
+
+### 17.9 guest 侧组件与注入链 / Guest Components
+
+**中文解读**：本文第 13 节装 Sileo、ElleKit，用它们注入 tweak。vphone-cli 的 guest hook
+**不依赖任何 bootstrap**：`cfw install` 时就把 dylib 放进 `/usr/lib`，靠自己的注入链加载。
+
+**（1）注入链**
+
+```
+launchd
+  └─ DYLD_INSERT_LIBRARIES=/usr/lib/launchdhook-vphone.dylib
+       └─ 每次 spawn 时判断目标路径
+            ├─ App（/Applications/**.app/**, /var/containers/Bundle/Application/**）
+            ├─ bootstrap 程序（/var/jb/** 或 .jbroot-*）
+            ├─ /usr/libexec/cameracaptured
+            └─ /usr/libexec/backboardd
+                 ↓ 再注入
+            /usr/lib/SystemHook-vphone.dylib
+                 ↓ 按目标进程选择
+            libcamfix / libvcamcaptured / libprefsfix / libsigninfix /
+            libbatteryhealthfix / libhapticsfix / libdevicehubfix /
+            libdevicename / libmisfix / libvphonegyro / libvphoneaccelerometer /
+            libvphoneattitude
+```
+
+（Flutter AOT 重映射不是独立 dylib，它编在 `SystemHook` 里，见下表。）
+
+日志落在 `/var/mobile/Library/Caches/vphone-launchdhook-injection.log`
+与 `vphone-launchdhook-spawn.log`，形如：
+
+```
+event=inserted+batteryhealthfix child=1586 path=/Applications/Preferences.app/Preferences status=0
+```
+
+一个很实际的坑写在代码注释里：**每个进程都会加载这个 hook（包括非 root 进程）**，
+所以日志文件必须对所有人可写。第一个写入者总是 root 的 `xpcproxy`，
+它创建的 0644 文件会**静默丢弃**所有 mobile 进程的行，看起来像 hook 根本没生效。
+所以每次打开都 `fchmod` 成 world-writable。
+
+**（2）各 dylib 的职责**
+
+| 组件 | 修什么问题 |
+| --- | --- |
+| `launchdhook-vphone` | 注入总闸；同时负责 arm64e X1 指令兼容的 spawn 路径 |
+| `SystemHook-vphone` | 按目标进程分发具体 hook；相机/运动守护进程的注入点；内含 Flutter AOT 重映射兼容 |
+| `libcamfix` | 前摄查询返回唯一 vcam 设备；给已加载 AVFoundation 的 app 用 |
+| `libvcamcaptured` | 在 `cameracaptured` 里供给相机帧 |
+| `libbatteryhealthfix` | 电池健康读数在虚拟硬件上不崩 |
+| `libhapticsfix` | 无振动硬件的机型不因触觉调用异常 |
+| `libdevicehubfix` | DeviceHub 相关界面 |
+| `libdevicename` | **设备名锁定**：让 Xcode / `devicectl` 看到 VM 名 |
+| `libprefsfix` | 隐藏 Settings 里不该出现的行（Apple Account 横幅、Software Update 等） |
+| `libsigninfix` | 抑制 Apple ID / Media & Purchases 登录 sheet（app 进程专用） |
+| `libmisfix` | 拦 `libmis` 的签名/安装策略，让 IPA 安装走得通 |
+| `libvphonegyro` / `libvphoneaccelerometer` / `libvphoneattitude` | 虚拟陀螺仪 / 加速度计 / 姿态，经 HID provider |
+| `libAppleParavirtCompilerPluginIOGPUFamily` | Metal 着色器编译（见 17.3） |
+| `VPhoneVirtIOSound.driver` | 音频 HAL 插件（含时钟、格式转换、延迟补偿） |
+
+**（3）服务画像与瘦身**
+
+模板的 setup boot 里会应用 `services.profile.apply`，**关掉约 140 个 launchd job**：
+Siri 与智能相关、Find My、Wallet/NFC/SE、Watch、Home、健康、地图后台、
+iCloud 与 iMessage 同步、广告与推荐、遥测、配件固件更新、OTA。
+
+实测收益（`Research/Guest/service_trimming.md`）：
+
+| Guest | 进程内存 | 宿主空闲 CPU | 宿主空闲写入 |
+| --- | --- | --- | --- |
+| iOS 27.0 | −29% | −26% | −60% |
+| iOS 26.6.2 | −30% | −39% | −94% |
+
+机制上它不是固件补丁：用的是 `launchctl disable` 写的 override
+（`/private/var/db/com.apple.xpc.launchd/disabled.plist`），
+**系统卷和 `launchd.plist` 一个字节都没动**，可完整回滚
+（vphoned 把禁用的 label 记在 `/var/db/vphoned/service-profile.plist`）。
+
+一个 iOS 27 的坑：launchd 会忽略被板型 jetsam 属性标记
+`DisableAllowed = false` 的 job，iOS 27 有 **19 个**这样的守护进程。
+`system-jetsamproperties-cfw-disable_allowed` 补丁把这些标记去掉，
+**不 patch 任何可执行文件**，只改 plist，并且备份/可还原。
+
+### 17.10 模板、快照与磁盘 / Templates, Snapshots, Disk
+
+**中文解读**：本文读者建一台虚拟机要重跑整条流水线（约 40–60 分钟，几十 GB 读写）。
+vphone-cli 的模板机制把它变成「第一次付全价，之后近乎免费」。
+
+**（1）一台虚拟机占多少**
+
+| 项 | 大小 |
+| --- | --- |
+| `Disk.img`（64 GB 逻辑） | 装完约 18.6 GB，首次启动后约 **20.5 GB** |
+| `nvram.bin` | 33.6 MB |
+| `SEPStorage` | 512 KB |
+| `.vphoned.signed` | 9.3 MB |
+| 恢复树（构建期临时） | 约 **11 GB** |
+| IPSW 缓存（库外，共享） | 12.3 GB + 1.2 GB |
+
+**（2）模板键**
+
+模板是「一台完整机器，只启动一次（setup boot），之后冻结」。它的标识符是
+**规范化描述的 SHA-256 前 12 位十六进制**，规范化描述包含：
+
+```
+format=2
+device=iPhone17,3
+ios=27.0/24A435
+cloudos=26.4/23E5207q
+preset=standard
+bootchain=<补丁计划摘要>
+series=2.10
+disk=64
+trim=standard/1
+setup=1
+services=trimmed
+service-groups=...
+removed-apps=...
+```
+
+于是「同样的选择」自动命中同一个模板，「不同的瘦身」各自并存，互不干扰。
+CPU、内存、屏幕、网络**不在**键里，它们是克隆后再设的。
+
+**（3）离线瘦身三档**
+
+| 档位 | 删什么 | 省 |
+| --- | --- | --- |
+| `none` | 不删 | 0 |
+| `conservative` | `usr/standalone/update` 内容（软件更新 ramdisk、基带固件） | 0.35 GB |
+| `standard` | conservative + AirPods/Beats 配对资源 + 表盘 + 未保留语言的 `LinguisticData` | **1.2 GB** |
+| `aggressive` | 保留档，**未在 guest 验证前拒绝使用** | — |
+
+关键细节：**删掉的文件一开始不释放空间**。`cfw install` 留下的
+`orig-fs.disabled.rn-*` 快照仍然持有所有块，而宿主**即使 root 也删不掉**它。
+只有 setup boot 的第一步把它删掉，空间才回来。所以：
+**没做 setup boot 的模板不允许 trim；trim 过的模板必须在快照消失后才能冻结/采纳。**
+
+**（4）setup boot 的 7 步**
+
+模板的 setup boot 就是把「每个克隆都应该有的起点」固化下来：
+
+1. 删 `orig-fs.disabled.rn-*` 快照；
+2. `setup.skip` 跳过设置向导；
+3. `setup.settle` 等首次启动的后台工作稳定（最多 10 分钟，
+   因为 installd 会在首次启动展开可移除系统 App）；
+4. `apps.remove_system` 移除系统 App（备份留在 guest 里）；
+5. `services.profile.apply` 应用瘦身画像（含关掉登录跟进守护进程）；
+6. 重启后校验：无残留快照、Setup 完成、画像里的服务没在跑、移除的 App 确实没了、vphoned 有应答；
+7. 清掉本次启动固定的设备名，干净关机。
+
+每一步都有 deadline。失败就停 VM、**不记录任何东西**、构建保持未冻结状态。
+
+**（5）克隆为什么几乎免费**
+
+模板和克隆之间是 **APFS `clonefile`** 关系：克隆后首次启动完约只占 **0.35 GB**，
+而不是 20.5 GB。代价是 `du` 和 Finder 会把每份都算成全尺寸，
+**只有 `df` 的空闲空间才是诚实的指标**。
+
+同样的机制也用于：
+
+- `vm clone`：普通克隆（保留身份，不能同时运行）或 `--new-identity`（新 ECID/UDID/MAC，可并行）；
+- `vm rebase`：让两台**分别恢复**的 VM 共享相同块（实测一对约省 8.7 GB）；
+- `vm snapshot`：磁盘 + `SEPStorage` + `nvram.bin` **三件套一起**，因为 SEP 的反重放计数器
+  在 `SEPStorage` 里，磁盘与它必须匹配，否则下次启动 SEP panic。
+
+**（6）模板的共享密钥代价（重要警告）**
+
+所有从同一模板克隆的机器**共享**：SEP 根密钥、Data 卷密钥、以及恢复和 setup boot 写入的数据。
+**一个克隆在原理上可以解密另一个的 Data 卷。**
+
+如果需要独立密钥（比如要登录 Apple 服务做多设备研究），必须用 `--no-template` 创建。
+
+### 17.11 安全模型与权限边界 / Security Model
+
+**中文解读**：本文 0.3 节的做法是「`csrutil disable` + `amfi_get_out_of_my_way=1`」。
+vphone-cli 提供了一条**保持 SIP 开启**的路径，这也是它相对本文最实质的安全改进。
+
+**（1）两条路径**
+
+| 路径 | 设置 | 代价 |
+| --- | --- | --- |
+| **A. 关闭 SIP + AMFI** | `csrutil disable` + `nvram boot-args="amfi_get_out_of_my_way=1 -v"` | 更宽松，全局削弱 |
+| **B. SIP 开启 + 放宽调试**（推荐） | `csrutil enable --without debug` + `allow-research-guests enable` + allowlist | 只放宽调试限制 |
+
+两条都**必须**先 `csrutil allow-research-guests enable`（这是 PV=3 的硬要求）。
+
+**（2）`vphone-escalator` 到底做了什么**
+
+这是整个项目里最精巧的一段系统编程。它解决的问题是：
+
+> 一个 ad-hoc 签名、带 `com.apple.private.*` entitlement 的二进制，amfid 会拒绝，
+> 内核在 exec 时杀掉。怎么办？
+
+常见答案是**改 amfid 的代码**（下断点、改 `ldrb`），但代码注释里明确写了为什么这不行：
+
+> 两种做法都会让 amfid 里出现一个 dirty、unsigned 的可执行页。在
+> `vm.cs_system_enforcement = 1` 的宿主上，内核下次 fault 进这个页会校验、
+> 发现没有签名、**把 amfid 杀掉**（`CODESIGNING / "Invalid Page"`）。
+> 这个 sysctl 运行时只读，所以「改代码」这条路走不通。
+
+它换了个思路：**用 AMFI 自己已有的功能**。
+
+AMFI 会读 `/Library/Preferences/com.apple.security.coderequirements.plist` 的两个键：
+
+| 键 | 作用 |
+| --- | --- |
+| `Entitlements` | 一个 code requirement 字符串，**替换** `_restrictedRequirement` |
+| `AllowUnsafeDynamicLinking` | BOOL，成为 validator 的 `_shouldUnrestrict`，让 `DYLD_INSERT_LIBRARIES` 重新被接受 |
+
+于是 `Entitlements` 里的 `cdhash H"..."` 就是一份**按二进制粒度的 allowlist**，
+由 Apple 自己的代码来评估。
+
+但整个 preference 被一个 BOOL ivar 门控：
+
+```c
+_isRunningInternalBuild = (csr_check(CSR_ALLOW_APPLE_INTERNAL) == 0)
+```
+
+所以这个工具**只写一个字节**：amfid 堆上那个单例里的 ivar。
+
+- 单例指针在 dyld shared cache 的一个静态槽里，**每个进程地址相同**。
+  工具通过解码 `+[AMFIRequirementsManager sharedManager]`、把每个它加载的地址
+  和本进程刚创建的单例比对来**找到这个槽**，**不硬编码任何地址**，
+  布局变化是「拒绝」，而不是「野写」；
+- 目标是 **malloc 出来的堆**：没有 `mach_vm_protect`、没有共享页 COW、
+  没有可执行内存，代码签名监控没有可反对的东西；
+- ivar 偏移来自**活的 ObjC 运行时**，不是常量。
+
+它需要 root + `task_for_pid`（即 SIP 放宽调试），这和让 amfid 尊重 preference 是同一个前提。
+
+`off` 只移除**这个工具加过的** hash，然后重启 amfid，保留 preference 和其他值。
+
+**（3）必须重复执行**
+
+因为 cdhash **每次签名都会变**，所以 `allow` 是**每次构建都要重跑**的一步，
+不是「一台机器做一次」。Launchpad 的做法是：helper 先复查宿主安全设置、
+校验 root 拥有的 bundle 和它记录的 cdhash，再以 root 跑那个 bundle 的
+`vphone-escalator allow`，然后重跑 preflight。
+
+**（4）`vphone-cli` 如何在没有权限的情况下诊断**
+
+`VPhoneGuestLaunchPlanner` 负责：解析运行中可执行文件旁边的 `vphone-vm`、
+检查它的 entitlement、**探测 AMFI**、并在被拒时**打印完整的 allowlist 命令**。
+它自己**从不获取 root**。
+
+对比本文：读者遇到 `Killed: 9` 只能自己猜。vphone-cli 把「谁拒绝了我、我该敲什么」
+直接印出来。这是二进制拆分的全部意义。
+
+### 17.12 网络四模式 / Networking
+
+**中文解读**：本文没有系统讲网络（只有 SSH ramdisk 阶段的 `iproxy`）。vphone-cli 有四种模式：
+
+| 模式 | guest 怎么上网 | 什么时候用 |
+| --- | --- | --- |
+| `nat` | Virtualization.framework 内置 NAT | 默认。Mac 没有 VPN，或 VPN 不需要承载 guest |
+| `bridged` | 直接挂在 Mac 的某个物理接口上，拿该网段的地址 | guest 要能被局域网其他机器访问 |
+| `tunnel` | 由 `vphone-vm` 用**普通 socket** 代理出去 | **Mac 走 VPN 或代理，guest 流量必须跟随** |
+| `none` | 不挂网络设备 | guest 必须离线 |
+
+**`tunnel` 模式为什么存在**：`nat` 和 `bridged` 都会让 guest 的包走物理接口出去。
+当 VPN 拥有 Mac 的默认路由（WireGuard、WARP，或 Surge / Clash 的 TUN 模式），
+这些包**绕过 VPN**：要么明文出去，要么根本出不去。
+
+`tunnel` 模式下 guest 的网卡**实现在 `vphone-vm` 进程里**：它自己应答 DHCP、ARP、网关 ping，
+把 guest 的每条 TCP 连接和 UDP 流转成 Mac 上的普通 socket。那些 socket 和任何 App 一样
+走 Mac 的路由表，于是 VPN 自然承载它们。**不需要 root、不需要新网卡、不改 Mac 网络设置。**
+
+guest 看到的固定值：
+
+| 项 | 值 |
+| --- | --- |
+| 地址 | `192.168.127.3/24`（DHCP） |
+| 网关 / DNS | `192.168.127.1` |
+| MTU | 1500 |
+| 到网关的其他连接 | Mac 的 loopback `127.0.0.1`（TCP/UDP） |
+
+限制也说得很清楚：**仅 IPv4**；除转发端口外**只出不进**；ICMP 只到网关
+（`ping 1.1.1.1` 会失败，但 TCP/UDP 正常）；吞吐受 `vphone-vm` 单进程限制。
+
+**其他网络能力**（本文都没有）：
+
+- **固定地址**：`vm config --ip`，NAT 模式须在 Mac 共享 NAT 网段内，vphoned 写进 guest；
+- **端口转发**：`--forward tcp:8022:22`，实现是宿主侧 `VPhoneTCPForwarder`；
+- **MAC 地址**：首次启动随机生成并存入 `config.plist`，之后保持同一身份与同一 DHCP 租约；
+- **mDNS**：`--mdns on` 让 guest 响应 `<vm-name>.local`，四种模式都支持；
+- **Mac 名解析**：`--mac-name`（默认开）让 guest **立刻**把 Mac 的 `<LocalHostName>.local`
+  解析到「guest 到达 Mac 的那个地址」，而不是去和 mDNS 应答赛跑。
+
+### 17.13 Launchpad：图形化的那一层 / The App
+
+**中文解读**：本文完全没有 GUI 层。vphone-cli 的 `vphone-launchpad.app` 把
+「下载固件 → 打补丁 → 恢复 → CFW → 首次启动」变成四个按钮。
+
+**（1）组件**
+
+| 组件 | 作用 |
+| --- | --- |
+| `vphone-launchpad.app` | SwiftUI Mac App |
+| `com.vphone.launchpad.helper` | **SMJobBless** 特权 helper，唯一的 root 面 |
+| `vphone-launchpad-cli` | 无状态客户端，通过同用户 Unix socket 和运行中的 App 通信 |
+| `vphone-launchpad-launcher` | 每台 VM 的 **responsible process** |
+
+**（2）helper 的能力被严格限定**
+
+helper 只做这几件事（`VPhoneLaunchpadHelperProtocol.swift`）：
+
+| 方法 | 作用 |
+| --- | --- |
+| `installBundle` | 把校验过的发布版装进 root 拥有的 store |
+| `allowVirtualMachine` | 跑那个 bundle 的 `vphone-escalator allow`（针对 receipt 固定的 `vphone-vm`） |
+| `installCustomFirmware` | 从 store 里跑 `cfw install`（先复查记录的 cdhash） |
+| `updateGuestEnvironment` | 同上，`cfw update-environment` |
+| `updateKernel` | 同上，`cfw update-kernel` |
+| `releaseOrphanedLeases` | 对**调用者自己拥有**的库目录跑 `vm leases --release-orphans` |
+
+**没有通用命令动词**。store 路径是
+`/Library/Application Support/vphone-launchpad/Bundles`。
+
+**（3）`vphone-launchpad-launcher` 为什么存在**
+
+Launchpad 通过它**分离启动** `vm launch`（独立 session、disclaim responsibility）。
+launcher 作为 app `Contents/MacOS` 里的工具，**归属于 app**，所以：
+麦克风、定位这些隐私提示和授权是 **app 的**，**按 Developer ID 签名问一次**，
+而不是按每个 ad-hoc 签名的 bundle 构建各问一次。
+
+**（4）系列匹配规则**
+
+Launchpad 和 `VPhone.bundle` 按**系列**匹配，也就是版本号前两段：
+
+- Launchpad `2.10.3` 可以和任意 `VPhone.bundle` `2.10.x` 配合，反之亦然；
+- 同系列内的补丁版本**必须双向可互换**；
+- 一旦改动 Launchpad 依赖的 bundle 侧任何东西（`vphone-cli` 参数或输出、
+  `vphone-escalator`、bundle 布局、receipt），就**必须升 minor 版本**
+  并提高 `VPhoneLaunchpadBundleStore.swift` 里的 `minimumBundleComponents`。
+
+### 17.14 与本文手工流程的逐条对照 / Writeup vs. Implementation
+
+**中文解读**：这张表是本节的核心交付物，把本文每一节的「手工动作」映射到工程实现。
+
+| 本文小节 | 手工做法 | vphone-cli 的实现 | 关键差异 |
+| --- | --- | --- | --- |
+| 0.3 宿主环境 | 关 SIP、关 AMFI、`authenticated-root disable` | `csrutil enable --without debug` + allowlist | **SIP 可保持开启** |
+| 0.4 PCC 虚拟机 | 手跑 `pccvre instance create` | 不需要，`fw prepare` 自己建临时 VM 并删掉 | 全自动 |
+| 3 改造 super-tart | 改 `VM.swift` 的 `vzHardwareModel_VRESEARCH101()` | `VPhoneVirtualMachineHardwareModel.createModel()` | 代码几乎逐行对应 |
+| 4–5 混合固件 | `get_fw.py` 解包 + 手工 copy 组件 | `fw prepare` 在临时目录合并，整体移入 | 三源分配规则固化 |
+| 6 打补丁 AVPBooter | `patch(0x..., nop)` | **OpenAVB 替代**，无需补丁；`fw patch` 自动跳过 | 换 ROM 而非打补丁 |
+| 7 改造 libirecovery | 编译 `wh1te4ever/libirecovery` | vendored C，编进 `VPhoneRestore` | 无外部工具 |
+| 8 打补丁固件组件 | 硬编码偏移 + `vbindiff` 人工核对 | **语义锚点定位** + `PatchRecord` 记录偏移与前后状态 | 换版本自动重定位 |
+| 9 恢复固件 | `idevicerestore` + `tsschecker` | `vphone-cli restore`（进程内） | 在线取票，`--offline` 可选 |
+| 10 SSH Ramdisk 修 Cryptex | 手动 `boot_rd.sh` + `iproxy` + scp | `cfw install` 离线挂载磁盘 | **不需要 ramdisk / SSH** |
+| 11 首次启动尝试 | 看串口日志猜 panic | `-v` / `-vv` / `-vvv` + 结构化错误 | |
+| 12 实现 Metal | 手工装 GPU bundle + 缺 dylib 就黑屏 | 自动从 cloudOS 提取 + 编译器插件用源码重建 | 不再依赖未公开 dylib |
+| 13 第二次启动 + 越狱 | 装 Sileo / ElleKit / dropbear / trollvnc | 不需要；`vphoned` + RPC 取代 | 无 bootstrap 依赖 |
+| 14 兼容性 | 锁死 26.1 (23B85) | 26.0–27.0.1 多组合，有兼容矩阵 | 靠动态定位而非固定偏移 |
+| 15 Sequoia 触摸 | `ScreenSharingVNC.swift` 重写鼠标事件 | `VPhoneVirtualMachineView` 完整输入模型 | 代码注释直接引用本文 |
+| 附录 A 补丁速查 | 偏移表 | 158 个**有名字、可开关、有版本门**的补丁声明 | 从「表」变成「模型」 |
+
+### 17.15 复现命令速查 / Command Cheat Sheet
+
+**中文解读**：如果你只是想用起来，这一节够了；想理解原理，回到前 16 节。
+
+```sh
+# ── 宿主准备（只需一次，需进 macOS 恢复模式）
+csrutil enable --without debug
+csrutil allow-research-guests enable
+# 重启后，放行当前构建的 vphone-vm（每次重新构建都要重跑）
+sudo "<bundle>/Contents/MacOS/vphone-escalator" allow "<bundle>/Contents/MacOS/vphone-vm"
+"<bundle>/Contents/MacOS/vphone-escalator" status
+"<bundle>/Contents/MacOS/vphone-cli" host preflight
+
+# ── 一条命令建机（模板化，第二次起近乎瞬时）
+vphone-cli vm create myphone \
+  --iphone-source /path/to/iPhone17,3_Restore.ipsw \
+  --cloudos-source /path/to/cloudOS.ipsw
+
+# ── 手动分步（研究用）
+vphone-cli vm new myphone
+vphone-cli fw prepare myphone --iphone-source ... --cloudos-source ...
+vphone-cli fw patch myphone
+vphone-cli vm launch myphone --dfu &
+vphone-cli restore myphone
+vphone-cli vm stop myphone
+vphone-cli cfw install myphone          # 需要 root
+vphone-cli vm launch myphone
+
+# ── 补丁管理
+vphone-cli fw patches myphone           # 看声明、预设、漂移
+vphone-cli fw set-patches myphone --block kernel-cfw-debugger
+vphone-cli fw patch myphone             # 重新解析并落盘
+vphone-cli cfw update-environment myphone   # 只更新 guest 侧（需要 root）
+vphone-cli cfw update-kernel myphone        # 只换 Preboot 内核（需要 root）
+
+# ── 日常运维
+vphone-cli vm list / info / config / clone / rename / delete
+vphone-cli vm snapshot create myphone clean --note "fresh"
+vphone-cli vm snapshot revert myphone clean
+vphone-cli vm rebase second --onto first --dry-run
+vphone-cli vm template list / show / trim / setup / adopt / delete
+vphone-cli vm export myphone --out myphone.tzst
+vphone-cli vm import myphone.tzst --name restored
+
+# ── 自动化
+vphone-cli vm launch myphone --api-listen 127.0.0.1:8765
+# 输出里有 [api] token: …
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/v1/health
+vphone-launchpad-cli guest rpc myphone device.info
+```
+
+**目录位置**：
+
+| 路径 | 内容 |
+| --- | --- |
+| `~/.vphone/machines/<name>/` | 单台 VM（磁盘、`config.plist`、补丁工作文件） |
+| `~/.vphone/machines/.templates/<id>/` | 模板（`vm list` 不显示，但确实占空间） |
+| `~/.vphone/ipsws/` | 远程 IPSW 缓存，所有 VM 共享 |
+| `~/.vphone/gpu-drivers/<version>_<build>/` | 从 cloudOS 提取的 GPU bundle |
+| `~/.vphone/patchsets/` | 导入的外部 patch set |
+| `~/.vphone/patches_presets/` | 用户自定义预设 |
+
+`VPHONE_ROOT` 可整体重定位；`VPHONE_LIBRARY_ROOT` 只重定位库。
+
+### 17.16 本节结论 / Takeaways
+
+**中文解读**：
+
+1. **本文的结论是对的，方法不是唯一的。** boot-args 字符串
+   `serial=3 -v debug=0x2014e %s`、三源混合的组件分配、TXM/kernel 的补丁点，
+   在 vphone-cli 里全部复现，但**没有一个硬编码偏移**。
+
+2. **最大的工程升级是「把补丁变成数据」。** 本文的补丁是代码里的一串调用；
+   vphone-cli 的补丁是有名字、有版本门、有预设、有选择、有计划、有回执的**声明**，
+   因此可以「开关、审计、检测漂移、可逆」。
+
+3. **最实质的安全改进是「不用关 SIP」。** 本文要求 `csrutil disable` +
+   `amfi_get_out_of_my_way=1`；vphone-cli 用 allowlist 精确放行那一个二进制。
+
+4. **最巧的一步是「换掉 boot ROM 而不是打补丁」。** OpenAVB / OpenSEP 让
+   iBoot 和 SEPOS 之前的代码不再出自 Apple，本文第 6 节整节的补丁工作因此消失。
+
+5. **最容易踩的坑从「偏移错了」变成了「组合不兼容」。** 本文读者担心的是
+   「换版本偏移全废」；vphone-cli 读者要担心的是
+   「这个 cloudOS 还有没有 `vphone600ap`」「这个 iOS 的 dyld cache 共享区放不放得下」。
+   后者有 `fw catalog`、兼容矩阵和 `cfw install` 的前置拒绝来兜底。
+
+> **一句话**：本文教你**为什么能跑起来**，vphone-cli 展示**怎么让它一直跑得下去**。
 
 ---
 
